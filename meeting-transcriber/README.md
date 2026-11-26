@@ -2,7 +2,7 @@
 
 Records a meeting (4 hours by default, up to 8, counted in recorded audio; a notice comes 10 minutes before it stops and you can extend it) **or loads any audio file**, writes a full transcript where **every line carries its language**
 (`[ru]`, `[en]`, `[de?]` — the `?` marks a low-confidence guess), and translates it to any language on request. The transcript and each translation are saved as separate text files.
-Use the **Mac app**, a terminal, or a Claude Code session in this folder (see [CLAUDE.md](CLAUDE.md)).
+Use the **Mac app**, a terminal, or a Claude Code session in this folder (the instructions it follows are in `CLAUDE.md`, which is kept only in the development repository).
 
 ```text
 [00:00:04] [en] Let's start with the budget.
@@ -93,8 +93,8 @@ export ANTHROPIC_API_KEY=sk-ant-...      # only for translation
 Since 1.11.0 `mt.py` itself is meant to run on Windows 10 and 11 (x64), from PowerShell. It has not been run on a real
 Windows PC yet. On a Windows CI runner (Windows Server 2025, no sound device, no GPU) the tests run. A second CI job,
 *Engine on Windows* (`tools/win_e2e.py`), is meant to run the real speech engine there (faster-whisper on CTranslate2,
-Whisper `tiny`, on the CPU); whether it passes is shown by its
-[latest run](https://github.com/AVZa-BL/mini-projs/actions/workflows/meeting-transcriber.yml). It installs
+Whisper `tiny`, on the CPU); whether it passes is shown by the latest run of the workflow `meeting-transcriber.yml` in the
+development repository (CI runs only there; the public copy of this folder has none). It installs
 `requirements.txt` into a venv like the lines below, but with setup-python's `python` for `py -3.12` and without the
 two `winget` lines, runs `mt.py prepare` (ffmpeg fetched by static-ffmpeg), and transcribes two English sentences from a
 file with a Cyrillic name, with stdout through a pipe and no `PYTHONUTF8`: once plainly, and twice with
@@ -765,7 +765,7 @@ translates, or `MT_TRANSLATOR=gemma`) uses Google's TranslateGemma 12B instead o
 
 ## Version
 
-`VERSION` holds the version (`python3 mt.py --version`, and the app's version); the [launcher](../launcher/README.md) shows it with the date of the last change.
+`VERSION` holds the version (`python3 mt.py --version`, and the app's version); the launcher, another project of the development repository, shows it with the date of the last change.
 Bump it when you change the tool or the app.
 
 ## Tests

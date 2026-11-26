@@ -88,7 +88,7 @@ struct Engine: Equatable {
 }
 
 enum AppInfo {
-    static let projectURL = "https://github.com/AVZa-BL/mini-projs/tree/main/meeting-transcriber"
+    static let projectURL = "https://github.com/AVZa-BL/public-mini-projects/tree/main/meeting-transcriber"
 
     static func versionString(info: [String: Any]?) -> String {
         let version = (info?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
