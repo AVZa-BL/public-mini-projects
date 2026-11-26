@@ -35,7 +35,7 @@ offline translation all run on your own computer; only translation with Claude s
 
 - A language switch *inside* a sentence is not caught; offline translation is below Claude's quality and NLLB's licence is non-commercial.
 - "Who spoke" is a guess from voices; the other side of a call is recorded only if you ask.
-- The Mac app is macOS only; recording behaviour was measured on one Mac, and Windows is not tested.
+- The app is macOS only (no Windows window app yet); the Windows command line is new and has not been run on a real Windows PC; recording behaviour was measured on one Mac.
 - Output is plain text: no SRT/VTT subtitles, no summaries.
 
 ➡️ **[Read the full overview: features, possibilities, limits, requirements and licences](meeting-transcriber/OVERVIEW.md)**
