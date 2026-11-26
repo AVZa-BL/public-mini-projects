@@ -1221,6 +1221,64 @@ def test_on_windows_a_long_input_name_is_cut_for_the_data_folder_it_makes(monkey
     assert re.fullmatch(r"\d{8}-\d{6}-a{64}", mt._new_dir("a" * 100).name)
 
 
+def test_on_windows_two_long_names_cut_to_the_same_64_characters_get_their_own_folders_within_the_cap(monkeypatch, tmp_path):
+    """Codex on #99: two inputs whose names agree in their first 64 characters, begun in the same second, made one
+    folder name, and the second failed with FileExistsError. The number now fits inside WIN_NAME_MAX (the name cut as far
+    as it needs), and a short name is not cut at all."""
+    from test_mt import FrozenClock
+    monkeypatch.setattr(mt, "DATA", tmp_path)
+    monkeypatch.setattr(mt, "datetime", FrozenClock)
+    monkeypatch.setattr(sys, "platform", "win32")
+    common = "Quarterly review with the regional sales teams and the board, part"
+    first, second = mt._new_dir(common + " one"), mt._new_dir(common + " two")
+    assert first != second and first.is_dir() and second.is_dir()
+    assert first.name == "20261126-152011-" + common[:64]
+    assert second.name == "20261126-152011-" + common[:62] + "-2"
+    for n in range(3, 11):
+        last = mt._new_dir(common + f" {n}")
+    assert last.name == "20261126-152011-" + common[:61] + "-10"
+    assert all(mt.utf16_len(d.name[16:]) <= mt.WIN_NAME_MAX for d in tmp_path.iterdir())
+    assert [mt._new_dir("short").name, mt._new_dir("short").name] == ["20261126-152011-short", "20261126-152011-short-2"]
+    emoji = "\U0001f600" * 32                                        # 64 UTF-16 units in 32 characters
+    assert mt._new_dir(emoji).name == "20261126-152011-" + emoji
+    assert mt._new_dir(emoji).name == "20261126-152011-" + "\U0001f600" * 31 + "-2"   # a whole character goes, never half
+    assert all(mt.utf16_len(d.name[16:]) <= mt.WIN_NAME_MAX for d in tmp_path.iterdir()), "counted in UTF-16 units"
+
+
+def test_on_windows_a_numbered_data_folder_too_long_for_the_path_limit_is_refused_before_anything_is_recorded(
+        monkeypatch, tmp_path, capsys):
+    """record checks its data folder's longest path before it begins, for the first folder of that second. A second
+    recording of that name in the same second gets `-2`, 2 characters longer: with the data folder at the limit it
+    passed that check and would have failed only when it wrote its text files, after the whole recording and
+    transcription. The numbered folder is checked again, removed again, and nothing is recorded."""
+    import signal
+    from test_mt import FrozenClock
+    _fake_recording(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(mt, "windows_long_paths", lambda: False)
+    monkeypatch.setattr(mt, "datetime", FrozenClock)
+    monkeypatch.setattr(mt, "OUT", None)                       # the text files stay in the data folder: weekly.English.txt
+    monkeypatch.setattr(mt, "utf8_streams", lambda: None)
+    monkeypatch.setattr(mt, "keep_awake", lambda cmd: None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-not-used")  # refused before any translation
+    monkeypatch.setattr(mt, "transcribe", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not transcribe")))
+
+    def problem(data, n):
+        monkeypatch.setattr(mt, "DATA", data)
+        return mt.windows_path_problem(mt._data_path(None, "weekly", n=n), ["English"], False, "weekly")
+    pad = next(k for k in range(1, 255) if problem(tmp_path / ("d" * (k + 1)), 1))   # the longest DATA the check passes
+    data = tmp_path / ("d" * pad)
+    assert problem(data, 1) is None and "would be 261 characters long" in problem(data, 2)
+    (data / "20261126-152011-weekly").mkdir(parents=True)     # the first recording of that name in this second
+    term = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(sys, "argv", ["mt.py", "record", "--name", "weekly", "--to", "English", "--hours", str(2 / 3600)])
+    with pytest.raises(SystemExit, match=r"weekly-2.weekly\.\w+\.txt would be 261 characters long.*Nothing was started"):
+        mt.main()
+    assert [d.name for d in data.iterdir()] == ["20261126-152011-weekly"], "the numbered folder is gone again"
+    assert "Recording to" not in capsys.readouterr().err
+    assert signal.getsignal(signal.SIGTERM) == term, "record() gave its SIGTERM handler back"
+
+
 # ---------- the PC, child processes, memory, files ----------
 def test_windows_is_kept_awake_while_a_long_command_runs_and_let_sleep_at_exit(monkeypatch):
     import atexit

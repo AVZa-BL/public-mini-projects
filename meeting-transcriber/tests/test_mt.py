@@ -1294,7 +1294,7 @@ def test_an_extend_signal_before_the_recorder_has_its_handler_is_ignored(monkeyp
     monkeypatch.setattr(mt, "DATA", tmp_path)
     seen = []
 
-    def fake_record(name, hours, device, system_device=None, live=None, notes=None):
+    def fake_record(name, hours, device, system_device=None, live=None, notes=None, check=None):
         os.kill(os.getpid(), signal.SIGUSR1)        # as early as the app's Extend can come: record() has no handler yet
         os.kill(os.getpid(), signal.SIGUSR2)        # the app's Pause likewise
         time.sleep(0.2)                              # the default action would have ended the process by now
@@ -2576,6 +2576,78 @@ def test_a_translation_model_that_will_not_load_leaves_the_live_transcript_runni
     out = capsys.readouterr().out
     assert track.decoded == 1 and worker.failed is None and worker.translation_off
     assert "@@NOTE\tLive translation is off (OSError" in out and "Live transcription stopped" not in out
+
+
+class FrozenClock(mt.datetime):
+    """datetime with now() stopped at one second, so that two jobs begin in the same second."""
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 11, 26, 15, 20, 11)
+
+
+def test_two_jobs_of_one_name_in_the_same_second_get_data_folders_of_their_own(monkeypatch, tmp_path):
+    """A batch of short clips with one file name in two folders (a/x.wav, b/x.wav), or a recording and a queued job,
+    began in the same second: the second one failed with FileExistsError (Codex on #99). Now it takes -2, -3 ...; a
+    folder another process made first is skipped the same way, and a job without a name numbers its folder alone."""
+    monkeypatch.setattr(mt, "DATA", tmp_path)
+    monkeypatch.setattr(mt, "datetime", FrozenClock)
+    made = [mt._new_dir("x") for _ in range(3)]
+    assert [d.name for d in made] == ["20261126-152011-x", "20261126-152011-x-2", "20261126-152011-x-3"]
+    assert all(d.is_dir() for d in made)
+    (tmp_path / "20261126-152011-y").mkdir()                       # made by another process a moment before
+    assert mt._new_dir("y").name == "20261126-152011-y-2"
+    assert [mt._new_dir("").name, mt._new_dir("").name] == ["20261126-152011", "20261126-152011-recording-2"]
+    assert mt._data_dir(None, "x").name == "20261126-152011-x-4"     # a new job's folder goes the same way
+    # The readers of a folder's name keep the date and take the number as part of the name.
+    assert re.sub(r"^\d{8}-\d{6}-?", "", made[1].name) == "x-2"
+    assert mt.hour_stamp(made[1]) == mt.hour_stamp(made[0])
+
+
+def test_a_second_nameless_folder_of_one_second_is_read_as_recording_2_not_2(monkeypatch, tmp_path):
+    """A bare `<stamp>-2` made its readers call the meeting "2": translate wrote 2.<Language>.txt, and the app would list
+    it as "2" and transcribe it with --stem 2. Numbered as recording-2, it reads as the hour folder's second recording."""
+    _fake_model(monkeypatch)
+    monkeypatch.setattr(mt, "DATA", tmp_path)
+    monkeypatch.setattr(mt, "datetime", FrozenClock)
+    monkeypatch.setattr(mt, "OUT", None)
+    monkeypatch.setattr(mt, "EVENTS", False)
+    mt._new_dir(None)
+    folder = mt._new_dir(None)
+    assert folder.name == "20261126-152011-recording-2"
+    mt._save(folder, {"source": "s", "whisper": "w", "lines": [{"t": 1.0, "lang": "ru", "conf": 1.0, "text": "Privet"}],
+                      "translations": {}})
+    monkeypatch.setattr(sys, "argv", ["mt.py", "translate", folder.name, "--offline", "--to", "English"])   # by its id
+    mt.main()
+    assert [p.name for p in folder.glob("*.English.txt")] == ["recording-2.English.txt"]
+
+
+def test_a_data_folder_that_is_no_folder_is_named_in_the_error_not_counted_through(monkeypatch, tmp_path):
+    """mkdir(parents=True) also raises FileExistsError when DATA itself exists but is no folder (a file; a dangling link,
+    as a moved MT_HOME leaves): that is not a taken number, and must not run 999 times into "999 data folders of that
+    name in one second"."""
+    data = tmp_path / "data"
+    monkeypatch.setattr(mt, "DATA", data)
+    data.write_text("")
+    with pytest.raises(FileExistsError) as e:
+        mt._new_dir("x")
+    assert Path(e.value.filename) == data and "999" not in str(e.value)
+    data.unlink()
+    try:
+        data.symlink_to(tmp_path / "moved away")
+    except OSError:                                  # Windows without the right to make links: the file case stands
+        return
+    with pytest.raises(FileExistsError) as e:
+        mt._new_dir("x")
+    assert Path(e.value.filename) == data and "999" not in str(e.value)
+
+
+def test_record_takes_its_folder_the_same_way(monkeypatch, tmp_path):
+    _fake_recording(monkeypatch, tmp_path)
+    names = []
+    real = mt._new_dir
+    monkeypatch.setattr(mt, "_new_dir", lambda name, check=None: names.append(name) or real(name, check))
+    folder = mt.record("x", 1 / 3600, None)[0]
+    assert names == ["x"] and folder.parent == tmp_path and re.fullmatch(r"\d{8}-\d{6}-x(-\d+)?", folder.name)
 
 
 def test_a_rerun_of_the_same_input_replaces_its_files_in_the_hour_folder_and_another_meeting_is_numbered(monkeypatch, tmp_path, capsys):

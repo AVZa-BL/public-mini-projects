@@ -694,7 +694,7 @@ def resolve_device(spec, what="input"):
              + "\n".join(f"  {i:>3}  {dict(devices)[i]['name']}" for i in found) + "\nNothing was started.")
 
 
-def record(name, hours, device, system_device=None, live=None, notes=None):
+def record(name, hours, device, system_device=None, live=None, notes=None, check=None):
     """Records the microphone (device) to mic.wav, and with system_device (a loopback or monitor input that carries what
     the computer plays: the other side of a call) also to system.wav, both from the same moment. Returns (folder, mic, system).
     The recording stops after `hours` of recorded audio (not wall-clock time: a sleeping computer does not use up the
@@ -704,7 +704,8 @@ def record(name, hours, device, system_device=None, live=None, notes=None):
     is a dict of transcription settings (language, granularity, me, them): speech is transcribed while the recording
     goes on, so that only the tail is left to do at the end. `notes`, when given, collects every note the recording gave,
     for the transcription that follows. With MT_CONTROL=stdin the lines pause, resume, extend, stop and cancel do what
-    SIGUSR2, SIGUSR1, SIGINT and SIGTERM do (see Control); the signals keep working beside them."""
+    SIGUSR2, SIGUSR1, SIGINT and SIGTERM do (see Control); the signals keep working beside them. `check` goes to _new_dir
+    (main's Windows path check, for a folder numbered -2 …)."""
     import signal
     extensions = [0]
     gate = [False]                             # closed while paused: the capture callbacks drop their blocks at once
@@ -752,13 +753,19 @@ def record(name, hours, device, system_device=None, live=None, notes=None):
     cancelled = None
     import sounddevice as sd
 
-    if "cancel" in commands:                       # cancelled while starting, before the folder exists (as SIGTERM then)
+    def release():                                 # before the folder exists: the handlers back as the caller had them
         for sig_name, handler in previous.items():
             signal.signal(getattr(signal, sig_name), handler)
         CONTROL.listen(previous_control)
+
+    if "cancel" in commands:                       # cancelled while starting, before the folder exists (as SIGTERM then)
+        release()
         raise RecordingCancelled("cancel on stdin")
-    d = DATA / (datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{name}" if name else ""))
-    d.mkdir(parents=True)
+    try:
+        d = _new_dir(name, check)                  # another recording of that name in the same second takes -2
+    except BaseException:                          # no folder (refused by `check`, or DATA unusable): nothing was recorded
+        release()
+        raise
     if EVENTS:
         ev("FOLDER", d)                            # the app keeps a folder being recorded out of its lists
     mic_wav = d / ("mic.wav" if system_device is not None else "audio.wav")
@@ -3734,25 +3741,57 @@ def _need_key(targets, offline=False):
                  "Nothing was started.")
 
 
-def _data_path(into, name):
-    """The data folder _data_dir makes or reuses, without making it."""
+def _data_path(into, name, stamp=None, n=1):
+    """The data folder _data_dir makes or reuses, without making it: `<yyyymmdd-hhmmss>-<name>`, or with n > 1 the n-th
+    one of that second (`…-<name>-2`; `…-recording-2` without a name). On Windows name and number together stay within
+    WIN_NAME_MAX, the name cut as far as needed. A numbered folder can still be up to 4 characters longer than the first
+    one, which the job's windows_path_problem checked before it began, so _new_dir checks it again (`check`)."""
     if into:
         return Path(into) if Path(into).is_dir() else DATA / into
     name = windows_folder_name(name)                 # an input file's own long name must not make the path too long there
-    return DATA / (datetime.now().strftime("%Y%m%d-%H%M%S") + (f"-{name}" if name else ""))
+    if n > 1:
+        # A nameless folder is read as "recording" (translate's stem, the app's list and --stem): numbered it stays that,
+        # as `recording-2` in the output folder's hour (claim_stem), where a bare `-2` would make the name "2".
+        name = name or "recording"
+        suffix = f"-{n}"
+        if sys.platform == "win32":
+            while utf16_len(name + suffix) > WIN_NAME_MAX:
+                name = name[:-1]
+        name += suffix
+    return DATA / ((stamp or datetime.now().strftime("%Y%m%d-%H%M%S")) + (f"-{name}" if name else ""))
 
 
-def _new_dir(name):
-    d = _data_path(None, name)
-    d.mkdir(parents=True)
-    return d
+def _new_dir(name, check=None):
+    """A new data folder. Another job that began in the same second under the same name (a batch of short clips with one
+    file name in two folders; two processes, such as a recording and a queued transcription; on Windows also two long
+    names that are the same in their first WIN_NAME_MAX characters) takes `-2`, `-3` … of that second instead of failing
+    with FileExistsError. mkdir without exist_ok decides, so two mt.py jobs never share one folder (only among mt.py's
+    own: the app makes a call's folder itself, Runner.startCall, and goes on in one that exists). `check`, when given,
+    is the job's Windows path check (it raises): a numbered folder is up to 4 characters longer than the first one, which
+    the job checked before it began, so it is checked again, and on a refusal removed again, before anything uses it."""
+    DATA.mkdir(parents=True, exist_ok=True)          # a DATA that is a file or a dangling link fails here, under its name
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for n in range(1, 1000):
+        d = _data_path(None, name, stamp, n)
+        try:
+            d.mkdir()                                # without parents: a FileExistsError is this folder, never DATA
+        except FileExistsError:
+            continue
+        if check and n > 1:                          # the first one is the folder the job checked
+            try:
+                check(d)
+            except BaseException:
+                d.rmdir()
+                raise
+        return d
+    raise FileExistsError(f"{_data_path(None, name, stamp)}: 999 data folders of that name in one second")
 
 
-def _data_dir(into, name):
+def _data_dir(into, name, check=None):
     """The data folder of a job: --into names an existing folder or a data id (a run cut short is continued there);
-    otherwise a new folder."""
+    otherwise a new folder (_new_dir, `check` as there)."""
     if not into:
-        return _new_dir(name)
+        return _new_dir(name, check)
     d = _data_path(into, name)
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -4195,17 +4234,20 @@ def run(a):
             _need_key(a.to, a.offline)
         _check_spoken(a.language)
         stays = not a.no_transcribe and not a.out and OUT is None    # the text files are written into the data folder
-        problem = windows_path_problem(_data_path(None, a.name), a.to if translating else [], a.offline,
-                                       (a.name or "recording") if stays else None)
-        if problem:
-            sys.exit(f"{problem}. Nothing was started.")
+
+        def refuse(folder):                                # now, and again on a numbered folder (_new_dir)
+            problem = windows_path_problem(folder, a.to if translating else [], a.offline,
+                                           (a.name or "recording") if stays else None)
+            if problem:
+                sys.exit(f"{problem}. Nothing was started.")
+        refuse(_data_path(None, a.name))
         device, system_device = resolve_device(a.device), resolve_device(a.system_device, "computer's-sound")   # before any download
         preflight(a.hours, 2 if a.system_device else 1, a.to if a.offline and translating else (), fetch=False)
         live = {"language": a.language, "granularity": a.granularity, "me": a.me, "them": a.them,
                 "targets": a.to, "offline": a.offline} if a.live else None
         rec_notes = []
         try:
-            d, wav, system_wav = record(a.name, a.hours, device, system_device, live, notes=rec_notes)
+            d, wav, system_wav = record(a.name, a.hours, device, system_device, live, notes=rec_notes, check=refuse)
         except RecordingCancelled as e:
             if e.folder is None:                           # cancelled before the folder was made: nothing was recorded
                 note(f"Recording cancelled ({e}) before it began; nothing was recorded")
@@ -4243,10 +4285,13 @@ def run(a):
             if not Path(f).is_file():
                 sys.exit(f"No such file: {f}")
         mic = Path(a.mic)
-        problem = windows_path_problem(_data_path(a.into, a.stem), a.to, a.offline)
-        if problem:
-            sys.exit(f"{problem}. Nothing was started.")
-        d = _data_dir(a.into, a.stem)
+
+        def refuse(folder):                                # now, and again on a numbered folder (_new_dir)
+            problem = windows_path_problem(folder, a.to, a.offline)
+            if problem:
+                sys.exit(f"{problem}. Nothing was started.")
+        refuse(_data_path(a.into, a.stem))
+        d = _data_dir(a.into, a.stem, refuse)
         problems = []
         doc = transcribe_call(mic, Path(a.system), d, a.me, a.them, a.language, a.granularity, not a.keep_echo, a.notes,
                               speakers=_speakers(a), diarizer=a.diarizer, problems=problems)
@@ -4271,10 +4316,13 @@ def run(a):
             stem = a.stem or stems.get(str(src), src.stem)
             if stem != src.stem:
                 print(f"note: {src} shares its name with another file; its files are called {stem}.*", file=sys.stderr)
-            problem = windows_path_problem(_data_path(a.into, stem), a.to, a.offline)
-            if problem:
-                raise RuntimeError(f"{problem}; nothing was transcribed")     # this file only: the batch goes on
-            d = _data_dir(a.into, stem)
+
+            def refuse(folder):                            # now, and again on a numbered folder (_new_dir)
+                problem = windows_path_problem(folder, a.to, a.offline)
+                if problem:
+                    raise RuntimeError(f"{problem}; nothing was transcribed")     # this file only: the batch goes on
+            refuse(_data_path(a.into, stem))
+            d = _data_dir(a.into, stem, refuse)
             doc = transcribe(src, d, a.language, a.track, a.granularity, notes=a.notes, speakers=_speakers(a), diarizer=a.diarizer)
             return write_outputs(doc, result_folder(a.out, src.parent, d), stem, a.to, offline=a.offline, data=d, audio=[(src, ".wav")])
         _each(a.files, work)
