@@ -3765,8 +3765,9 @@ def _new_dir(name, check=None):
     """A new data folder. Another job that began in the same second under the same name (a batch of short clips with one
     file name in two folders; two processes, such as a recording and a queued transcription; on Windows also two long
     names that are the same in their first WIN_NAME_MAX characters) takes `-2`, `-3` … of that second instead of failing
-    with FileExistsError. mkdir without exist_ok decides, so two mt.py jobs never share one folder (only among mt.py's
-    own: the app makes a call's folder itself, Runner.startCall, and goes on in one that exists). `check`, when given,
+    with FileExistsError. mkdir without exist_ok decides, so two jobs never share one folder; the app makes the folder of
+    a call it records itself, by the same names and numbers and the same rule (app/Sources/Core/DataFolder.swift, since
+    1.11.2), so a call and an mt.py job do not share one either. `check`, when given,
     is the job's Windows path check (it raises): a numbered folder is up to 4 characters longer than the first one, which
     the job checked before it began, so it is checked again, and on a refusal removed again, before anything uses it."""
     DATA.mkdir(parents=True, exist_ok=True)          # a DATA that is a file or a dangling link fails here, under its name

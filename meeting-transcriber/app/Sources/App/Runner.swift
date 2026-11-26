@@ -412,11 +412,15 @@ final class Runner: ObservableObject {
         pauseClock = PauseClock()
         recordingPaused = false
         holdRecording()
-        let stamp = DateFormatter()
-        stamp.dateFormat = "yyyyMMdd-HHmmss"
-        let name = settings.recordName.trimmingCharacters(in: .whitespaces)
-        let folder = engine.data.appendingPathComponent(stamp.string(from: Date()) + (name.isEmpty ? "" : "-" + name), isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // Named and numbered as mt.py names its own data folders: another job of this name begun in the same second (a
+        // file named like the call, transcribed from the queue) keeps its folder, and the call takes -2 (DataFolder).
+        let folder: URL
+        do {
+            folder = try DataFolder.make(in: engine.data, name: settings.recordName)
+        } catch {
+            callNotStarted("The call's folder could not be made in \(engine.data.path): \(error.localizedDescription)")
+            return
+        }
         let rec = CallRecorder()
         recorder = rec
         callScript = script
@@ -633,6 +637,22 @@ final class Runner: ObservableObject {
                 self.updateActivity()
             }
         }
+    }
+
+    /// The call could not begin, before any recorder existed (its folder could not be made): told as a failed recording,
+    /// as callFailed tells one, with nothing to stop.
+    private func callNotStarted(_ message: String) {
+        recordingSince = nil
+        recordingPaused = false
+        var s = recordingState ?? RunState(kind: .record)
+        s.apply(.text(message))
+        s.finish(exitStatus: 1, stopRequested: false)
+        recordingState = s
+        lastFinished = s
+        NSSound(named: NSSound.Name("Basso"))?.play()
+        showOutcomeAlert = true
+        releaseRecording()
+        updateActivity()
     }
 
     /// The recording could not start. A start that ends because Cancel or Stop came meanwhile is not a failure: that stop

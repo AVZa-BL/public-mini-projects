@@ -700,5 +700,45 @@ expect(!intel.isSpeaker(uid: hdaPhones, kind: .headphones) && intel.isSpeaker(ui
        "follow: an untick on an Intel Mac's speakers leaves its jack headphones")
 expect(OutputFollowing.untickedNote(output: "TG659").contains("“TG659”"), "follow: the note names the output")
 
+// MARK: data folders the app makes itself (a call): named and numbered as mt.py names its own
+do {
+    var when = DateComponents()
+    when.year = 2026; when.month = 11; when.day = 26; when.hour = 15; when.minute = 20; when.second = 11
+    let date = Calendar(identifier: .gregorian).date(from: when)!            // local time, as the stamp is
+    expect(DataFolder.stamp(date) == "20261126-152011", "data folder: the stamp is mt.py's, local time")
+    expect(DataFolder.name(stamp: "S", name: "weekly call") == "S-weekly call" && DataFolder.name(stamp: "S", name: "") == "S",
+           "data folder: the first of a second")
+    expect(DataFolder.name(stamp: "S", name: " x ", number: 3) == "S-x-3" && DataFolder.name(stamp: "S", name: "", number: 2) == "S-recording-2",
+           "data folder: numbered as mt.py numbers (-recording-2 without a name)")
+    let data = tempDir("datafolder").appendingPathComponent("data", isDirectory: true)    // not there yet: made
+    let first = try? DataFolder.make(in: data, name: "call", date: date)
+    let second = try? DataFolder.make(in: data, name: "call", date: date)
+    let third = try? DataFolder.make(in: data, name: "call", date: date)
+    expect([first, second, third].map { $0?.lastPathComponent } == ["20261126-152011-call", "20261126-152011-call-2", "20261126-152011-call-3"],
+           "data folder: a second and a third call of one name in one second get folders of their own")
+    var isDir: ObjCBool = false
+    expect(fm.fileExists(atPath: third?.path ?? "", isDirectory: &isDir) && isDir.boolValue, "data folder: it is made")
+    // An mt.py job made the plain one first (here a file in its place does the same): the call takes the next number.
+    expect(fm.createFile(atPath: data.appendingPathComponent("20261126-152011-talk").path, contents: Data()), "data folder: setup, a file in the plain folder's place")
+    expect((try? DataFolder.make(in: data, name: "talk", date: date))?.lastPathComponent == "20261126-152011-talk-2",
+           "data folder: a name another job holds is skipped, never shared")
+    let nameless1 = try? DataFolder.make(in: data, name: "", date: date)
+    let nameless2 = try? DataFolder.make(in: data, name: "  ", date: date)
+    expect(nameless1?.lastPathComponent == "20261126-152011" && nameless2?.lastPathComponent == "20261126-152011-recording-2",
+           "data folder: without a name")
+    let parsed = Recordings.parse(folderName: "20261126-152011-call-2")
+    expect(parsed.0 == date && parsed.1 == "call-2" && Recordings.parse(folderName: "20261126-152011-recording-2").1 == "recording-2",
+           "data folder: Recordings reads a numbered one back, date and name")
+    let notAFolder = tempDir("datafolder-file").appendingPathComponent("data")
+    expect(fm.createFile(atPath: notAFolder.path, contents: Data()), "data folder: setup, a file where the data folder goes")
+    // A dangling link with the plain name counts as taken (mkdir's EEXIST), as in mt.py, not as an error.
+    let linked = data.appendingPathComponent("20261126-152011-link")
+    if (try? fm.createSymbolicLink(atPath: linked.path, withDestinationPath: "/nonexistent/mt-datafolder")) != nil {
+        expect((try? DataFolder.make(in: data, name: "link", date: date))?.lastPathComponent == "20261126-152011-link-2",
+               "data folder: a dangling link with the name is skipped too")
+    }
+    expect((try? DataFolder.make(in: notAFolder, name: "call", date: date)) == nil, "data folder: a data folder that is a file is an error, not a loop")
+}
+
 print("\(passes) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

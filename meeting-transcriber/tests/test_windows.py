@@ -901,8 +901,13 @@ def test_nothing_captured_while_paused_by_the_lines_reaches_the_file(monkeypatch
     threading.Timer(1.3, lambda: control.send("stop\n")).start()            # stopped while paused, with blocks pending
     folder, wav, _ = mt.record("x", 60 / 3600, None)
     written = set(sf.read(str(wav), dtype="int16")[0].reshape(-1).tolist())
-    paused = {n for n, t in StampedStream.deliveries if marks["pause"] + 0.05 < t < marks["resume"] - 0.02
-              or t > marks["pause2"] + 0.05}
+    # How long after a pause line its gate can still be open: 0.05 s to hand the line over and act on it, and on Windows
+    # one poll of stdin_reader's pipe reader (it looks every 50 ms, so no read is left pending) plus Windows' timer ticks
+    # (a sleep can run about 15.6 ms long). With 0.05 s alone run c0d0d04 counted block 124, written 0.05-0.07 s after
+    # the line, as captured while paused.
+    lag = 0.05 + (0.1 if sys.platform == "win32" else 0.0)
+    paused = {n for n, t in StampedStream.deliveries if marks["pause"] + lag < t < marks["resume"] - 0.02
+              or t > marks["pause2"] + lag}
     assert paused and not (paused & written), sorted(paused & written)[:5]
     before = {n for n, t in StampedStream.deliveries if t < marks["pause"] - 0.02}
     assert before <= written, "what came before the pause is all there"

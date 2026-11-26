@@ -234,7 +234,7 @@ call.English.txt        [00:00:12] [ru] Good afternoon, colleagues! ...     (tag
   recording gives (a pause, a gap,
   a stop at the limit) goes into its own transcription too; `--note "[hh:mm:ss] text"` places a note at that time instead of the top.
   The name (`--name`) becomes part of the folder and file names, so it cannot contain `/` or `:`. Stored transcripts (`transcript.json`) live in `data/<id>/`, which is git-ignored.
-  A data id is the time a job began and its name (`20261126-152011-weekly`); another `mt.py` job of the same name begun in the same second (two short clips both called `x.wav`, a recording and a queued job) gets `-2`, `-3` …, and one without a name `-recording-2` (since 1.11.1; before, it failed with "File exists"). The app makes the folder of a call it records itself, without this numbering.
+  A data id is the time a job began and its name (`20261126-152011-weekly`); another `mt.py` job of the same name begun in the same second (two short clips both called `x.wav`, a recording and a queued job) gets `-2`, `-3` …, and one without a name `-recording-2` (since 1.11.1; before, it failed with "File exists"). The app numbers the folder of a call it records the same way (since 1.11.2; before, a call begun in the same second as an `mt.py` job of its name wrote into that job's folder).
 
 ## Permissions and updates (the app's signing identity)
 
