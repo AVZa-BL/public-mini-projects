@@ -1,0 +1,19 @@
+# Optional, Windows x64 with an NVIDIA GPU: the CUDA 12 libraries that CTranslate2 4.9.x loads at run time but does not
+# ship (cuBLAS, and NVRTC, which cuBLAS requires). mt.py finds them in site-packages\nvidia\<library>\bin by itself
+# (nvidia_libraries in mt.py). Without them, or without a working NVIDIA driver, it runs on the CPU and says so once.
+# About 0.63 GB to download.
+#
+#   .venv\Scripts\python -m pip install -r requirements.txt
+#   .venv\Scripts\python -m pip install -r requirements-cuda-windows.txt
+#   $env:MT_DEVICE = "cuda"; .venv\Scripts\python mt.py prepare    # optional: an error instead of the CPU fallback, to test the GPU
+#
+# Pins, from the PyPI JSON read on 2026-11-26:
+# - nvidia-cublas-cu12 12.9.2.10 is the newest release with a win_amd64 wheel (553 MB); 12.9.3.13 has none.
+# - nvidia-cuda-nvrtc-cu12, which nvidia-cublas-cu12 requires, pinned to its newest CUDA 12 release with a win_amd64
+#   wheel (76 MB).
+# - No cuDNN: the Windows ctranslate2.dll 4.9.1 names cublas64_12.dll and nvcuda.dll but no cuDNN library or function
+#   (string scan, ASCII and UTF-16; its Conv1D has its own GPU code), so the 693 MB nvidia-cudnn-cu12 wheel would not be
+#   used. The cuDNN 9 dispatcher cudnn64_9.dll that its wheel ships is loaded at import and never called. If a GPU run
+#   ever fails with a cuDNN library missing, add: nvidia-cudnn-cu12==9.10.2.21 (the dispatcher's own release).
+nvidia-cublas-cu12==12.9.2.10; sys_platform == "win32" and platform_machine == "AMD64"
+nvidia-cuda-nvrtc-cu12==12.9.86; sys_platform == "win32" and platform_machine == "AMD64"

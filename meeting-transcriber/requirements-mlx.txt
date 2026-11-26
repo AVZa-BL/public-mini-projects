@@ -1,0 +1,8 @@
+# The Apple-GPU parts (optional): Apple silicon, macOS 14 or newer, Python 3.10 or newer.
+# mlx-whisper: the speech model on the GPU (MT_ENGINE=auto takes it when installed).
+mlx-whisper>=0.4
+# mlx-lm: TranslateGemma 12B, the second offline translator (--translator gemma); 0.29.1 is the version it was tested
+# with on a Mac (stream_generate, TokenizerWrapper.add_eos_token).
+mlx-lm==0.29.1
+# The transformers version that test ran with: mlx-lm 0.29.1 sets no upper bound, and transformers 5 is untested here.
+transformers==4.57.6

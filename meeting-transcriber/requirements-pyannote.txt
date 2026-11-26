@@ -1,0 +1,4 @@
+# Optional: the pyannote speaker-separation backend (--diarizer pyannote, "Use pyannote" in the app). About 2 GB of packages,
+# Python 3.10 or newer; the pipeline pyannote/speaker-diarization-community-1 is gated on huggingface.co: accept its conditions
+# once and give a Hugging Face token (HF_TOKEN) for the one-time download. Slower than sherpa on a CPU, better at telling voices apart.
+pyannote.audio>=4

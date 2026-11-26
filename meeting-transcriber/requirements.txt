@@ -1,0 +1,6 @@
+faster-whisper>=1.1
+anthropic>=0.40
+sounddevice>=0.5
+soundfile>=0.12
+static-ffmpeg>=3
+sherpa-onnx>=2.0
