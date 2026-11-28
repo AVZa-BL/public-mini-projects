@@ -229,12 +229,20 @@ final class ViewFlags: ObservableObject {
     @Published var targetQuery = ""
     @Published var showSpokenLanguages = false   // the "languages spoken" drop-down is open
     @Published var spokenQuery = ""
+    @Published var expandProcessing = false      // a job beside a recording: shown in full instead of its one-line strip
 }
 
+/// The window: three columns side by side (C1). Controls (the settings, Start, the stored recordings) | Session (the
+/// recording or the job: its header, the transcript, the results, a job beside a recording as a strip, the status bar)
+/// | Telemetry (the dashboard's cards). In a window narrower than the three columns need, the Telemetry column folds into
+/// a strip of cards above the transcript. The telemetry objects are observed only by the views that show them, so a
+/// STAT or a LEVEL never re-evaluates this body; the transcript list is Equatable on its RunState's revision.
 struct ContentView: View {
     @EnvironmentObject private var runner: Runner
     @StateObject private var prefs = Prefs()
     @StateObject private var flags = ViewFlags()
+    @ObservedObject private var layout = LayoutPrefs.shared
+    @ObservedObject private var display = DisplayPrefs.shared
 
     private var settings: JobSettings { return prefs.settings }
     private var recording: Bool { return runner.isRecording }
@@ -250,37 +258,17 @@ struct ContentView: View {
         return list
     }
 
+    /// The column widths (C1): Controls 360-520, Session from 520, Telemetry 300-420.
+    private static let controlsMin: CGFloat = 360
+    private static let sessionMin: CGFloat = 520
+    private static let telemetryMin: CGFloat = 300
+
     var body: some View {
-        ScrollViewReader { window in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if !engineReady { engineSection }
-                    if runner.ffmpegMissing { ffmpegNotice }
-                    inputSection
-                    if prefs.mode != .translate { spokenSection; speakersSection }
-                    outputSection
-                    translateSection
-                    optionsSection
-                    actionBar
-                    if let state = runner.recordingState { recordingSection(state).id("recording") }
-                    if let state = runner.state { processingSection(state).id("processing") }
-                    if !runner.recordings.isEmpty { recordingsSection }
-                }
-                .padding(16)
-            }
-            // The panels sit under the settings, below the window's fold at its default size: bring the recording's into
-            // view when it appears and when its first line arrives, and a job's when it starts.
-            .onChange(of: runner.recordingState != nil) { shown in
-                if shown { withAnimation { window.scrollTo("recording", anchor: .top) } }
-            }
-            .onChange(of: runner.recordingState?.lines.isEmpty == false) { hasLines in
-                if hasLines { withAnimation { window.scrollTo("recording", anchor: .top) } }
-            }
-            .onChange(of: runner.queue.current?.id) { current in
-                if current != nil && runner.recordingState == nil { withAnimation { window.scrollTo("processing", anchor: .top) } }
-            }
+        GeometryReader { geometry in
+            columns(width: geometry.size.width)
         }
-        .frame(minWidth: 720, minHeight: 640)
+        .frame(minWidth: 980, minHeight: 660)
+        .toolbar { toolbarContent }
         .onAppear {
             runner.refresh()
             runner.currentSettings = { [weak prefs] in prefs?.settings ?? JobSettings() }
@@ -298,6 +286,222 @@ struct ContentView: View {
                 Button("Show Files") { reveal(first) }
             }
         } message: { Text(alertMessage) }
+    }
+
+    @ViewBuilder private func columns(width: CGFloat) -> some View {
+        let controls = layout.showControls
+        let needed = (controls ? ContentView.controlsMin : 0) + ContentView.sessionMin + ContentView.telemetryMin
+        let telemetryBeside = layout.showTelemetry && width >= needed
+        HSplitView {
+            if controls {
+                controlsColumn
+                    .frame(minWidth: ContentView.controlsMin, idealWidth: 420, maxWidth: 520, maxHeight: .infinity)
+            }
+            sessionColumn(telemetryStrip: layout.showTelemetry && !telemetryBeside)
+                .frame(minWidth: ContentView.sessionMin, maxWidth: .infinity, maxHeight: .infinity)
+            if telemetryBeside {
+                telemetryView(compact: false)
+                    .frame(minWidth: ContentView.telemetryMin, idealWidth: 340, maxWidth: 420, maxHeight: .infinity)
+            }
+        }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .navigation) {
+            if recording {
+                Button(action: { runner.stopRecording() }) { Label("Stop", systemImage: "stop.circle") }
+                    .help("Stop the recording; its transcription is queued")
+                Button(action: { if runner.recordingPaused { runner.resumeRecording() } else { runner.pauseRecording() } }) {
+                    Label(runner.recordingPaused ? "Resume" : "Pause", systemImage: runner.recordingPaused ? "play.circle" : "pause.circle")
+                }
+                .disabled(!runner.recordingReady)
+                .help("Nothing is recorded while paused; the recording and its transcript leave the pause out, and a note says where it was.")
+                Button(action: { runner.extendRecording() }) { Label("Extend by 1 h", systemImage: "plus.circle") }
+                    .disabled(!runner.recordingReady)
+                    .help("Extend by 1 h")
+            } else {
+                Button(action: startRecordingFromToolbar) { Label("Record", systemImage: "record.circle") }
+                    .disabled(!engineReady || !recordProblems.isEmpty)
+                    .help(recordProblems.isEmpty ? "Start a recording with the settings in the Controls column" : recordProblems.joined(separator: " "))
+            }
+        }
+        ToolbarItem(placement: .principal) {
+            ToolbarStatus(store: runner.telemetry, recording: recording, paused: runner.recordingPaused, since: runner.recordingSince,
+                          recordedTime: { [weak runner] date in runner?.recordedTime(at: date) }, jobText: toolbarJobText)
+        }
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button(action: { layout.showControls.toggle() }) {
+                Label(layout.showControls ? "Hide Settings" : "Show Settings", systemImage: "sidebar.left")
+            }
+            .help("Show or hide the Controls column (Option-Command-S)")
+            Button(action: { layout.showTelemetry.toggle() }) {
+                Label(layout.showTelemetry ? "Hide Telemetry" : "Show Telemetry", systemImage: "waveform.path.ecg")
+            }
+            .help("Show or hide the Telemetry column (Option-Command-T)")
+        }
+    }
+
+    /// "Transcribing … · 41 %" while a job runs (nil otherwise).
+    private var toolbarJobText: String? {
+        guard let job = runner.queue.current, let state = runner.state, state.phase != .finished else { return nil }
+        if state.chunks > 0 { return job.label + " · " + Format.percent(state.fileFraction) }
+        return job.label
+    }
+
+    /// The settings as Record would start them (the mode switched to Record), and what stops them.
+    private var recordSettings: JobSettings {
+        var s = settings
+        s.mode = .record
+        return s
+    }
+
+    private var recordProblems: [String] {
+        var list = recordSettings.validationProblems()
+        if recordSettings.needsAPIKey && !runner.hasAPIKey { list.append("Add your Claude API key to translate (Set Key…).") }
+        return list
+    }
+
+    private func startRecordingFromToolbar() {
+        guard !recording else { return }
+        prefs.mode = .record
+        runner.start(prefs.settings)
+    }
+
+    // MARK: - Columns
+
+    private var controlsColumn: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if !engineReady { engineSection }
+                if runner.ffmpegMissing { ffmpegNotice }
+                inputSection
+                if prefs.mode != .translate { spokenSection; speakersSection }
+                outputSection
+                translateSection
+                optionsSection
+                actionBar
+                if !runner.recordings.isEmpty { recordingsSection }
+            }
+            .padding(16)
+        }
+    }
+
+    /// Which session the telemetry shows: the recording, the job (both run: as the dashboard's picker says), or the machine.
+    private var telemetrySource: TelemetrySource {
+        let hasRecording = runner.recordingState != nil, hasJob = runner.state != nil
+        if hasRecording && hasJob { return layout.dashboardShowsJob ? .processing : .recording }
+        if hasRecording { return .recording }
+        if hasJob { return .processing }
+        return .machine
+    }
+
+    private func state(of source: TelemetrySource) -> RunState? {
+        switch source {
+        case .recording: return runner.recordingState
+        case .processing: return runner.state
+        case .machine: return nil
+        }
+    }
+
+    /// What the dashboard takes from the transcript and the job: values, compared before the dashboard is drawn again.
+    private func dashboardContext(_ source: TelemetrySource) -> DashboardContext {
+        var c = DashboardContext()
+        c.source = source
+        c.hasRecording = runner.recordingState != nil
+        c.hasProcessing = runner.state != nil
+        c.trackNames = runner.recordingTrackNames
+        if let s = state(of: source) {
+            c.languages = s.languageCounts.map { LanguageCount(code: $0.key, count: $0.value) }
+                .sorted { $0.count == $1.count ? $0.code < $1.code : $0.count > $1.count }
+            c.spokenLines = s.spokenLines
+            c.engineCheck = s.checks["engine"]
+            if source == .processing {
+                c.chunk = s.chunk
+                c.chunks = s.chunks
+                c.fileFraction = s.fileFraction
+                c.eta = s.eta
+                c.jobLabel = runner.queue.current?.label
+            }
+        }
+        return c
+    }
+
+    private func telemetryView(compact: Bool) -> some View {
+        TelemetryColumn(store: runner.telemetry, layout: layout, display: display, context: dashboardContext(telemetrySource), compact: compact)
+            .equatable()
+    }
+
+    @ViewBuilder private func sessionColumn(telemetryStrip: Bool) -> some View {
+        VStack(spacing: 0) {
+            if telemetryStrip {
+                telemetryView(compact: true)
+                Divider()
+            }
+            sessionContent
+                .padding(12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            Divider()
+            TelemetryStatusBar(store: runner.telemetry, layout: layout, source: telemetrySource,
+                               engineCheck: state(of: telemetrySource)?.checks["engine"])
+        }
+    }
+
+    @ViewBuilder private var sessionContent: some View {
+        if let state = runner.recordingState {
+            recordingSession(state)
+        } else if let state = runner.state {
+            processingSession(state)
+        } else {
+            idleSession
+        }
+    }
+
+    /// Nothing has run yet in this window: what to do, and the last outcome if there is one.
+    private var idleSession: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "waveform").font(.system(size: 44)).foregroundStyle(.secondary)
+            Text("Start a recording or drop audio/video files here").font(.title3)
+            Text(engineReady ? "Choose what to do in the Controls column, or press Record in the toolbar."
+                             : "First set up the speech engine in the Controls column.")
+                .foregroundStyle(.secondary)
+            if let last = runner.lastFinished {
+                GroupBox(alertTitle) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(alertMessage).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                        outputRows(last)
+                    }
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: 520)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// The notes, files, errors and log of a session: in a bounded scroll area under a transcript, else filling the column.
+    /// `extra`: the queue's rows too (the job's own area).
+    @ViewBuilder private func resultsArea(_ state: RunState, bounded: Bool, extra: Bool = false) -> some View {
+        let queued = extra && !runner.queue.pending.isEmpty
+        let rows = state.notes.count + state.outputs.count + state.errors.count + (state.log.isEmpty ? 0 : 1)
+            + (queued ? runner.queue.pending.count + 1 : 0)
+        if rows > 0 {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    resultRows(state)
+                    if queued { queueRows }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Under a transcript: as tall as its rows need (about 26 pt each, the open Details log more), at most 170 pt,
+            // so the transcript keeps the room; a ScrollView alone would take all 170 pt even for one row.
+            .frame(height: bounded ? min(170, flags.showLog && !state.log.isEmpty ? 170 : CGFloat(rows) * 26 + 8) : nil)
+            .frame(maxHeight: bounded ? 170 : .infinity)
+        }
     }
 
     // MARK: - Engine
@@ -713,40 +917,62 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - The recording panel
+    // MARK: - The recording (Session column)
 
-    @ViewBuilder private func recordingSection(_ state: RunState) -> some View {
-        GroupBox("Recording") {
-            VStack(alignment: .leading, spacing: 8) {
-                if state.phase == .recording {
-                    recordingRow(state)
-                    let text = state.progressText
-                    if !text.isEmpty {
-                        Text("Live: " + text).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
-                    } else if prefs.live && !prefs.transcribeLater {
-                        // Until the first line there is nothing else to see of the live transcription: say what it waits for.
-                        Text(liveWaitText(state, short: false))
-                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                    Text("Who spoke, the translation of the files, the names of the two sides and the output folder can still be changed: they apply when the recording stops."
-                         + (prefs.live && !prefs.transcribeLater ? " The languages translated live are the ones chosen when the recording started. Changing the spoken languages or the granularity now makes the final pass redo what was transcribed live." : ""))
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                } else if state.phase == .working {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(state.stage.isEmpty ? "Saving the recording…" : state.stage)
-                    }
-                } else {
-                    Text(state.outcome == .stopped ? "Recording cancelled: the audio stays in the data folder."
-                         : state.outcome == .completed ? "Recording saved." : "The recording ended with an error.")
-                }
-                // The pane is there from the start of a live recording (empty until the first stretch of speech is closed),
-                // so the transcript and its translation have their place on screen before the first line comes.
-                if !state.lines.isEmpty || (state.phase == .recording && prefs.live && !prefs.transcribeLater) { transcriptPane(state) }
-                resultRows(state)
+    private func recordingPaneShown(_ state: RunState) -> Bool {
+        // The pane is there from the start of a live recording (empty until the first stretch of speech is closed), so
+        // the transcript and its translation have their place on screen before the first line comes.
+        return !state.lines.isEmpty || (state.phase == .recording && prefs.live && !prefs.transcribeLater)
+    }
+
+    @ViewBuilder private func recordingSession(_ state: RunState) -> some View {
+        let pane = recordingPaneShown(state)
+        VStack(alignment: .leading, spacing: 8) {
+            GroupBox("Recording") {
+                recordingHeader(state)
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(6)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            if pane {
+                transcriptPane(state, session: "recording", source: .recording)
+                    .frame(minHeight: 240, maxHeight: .infinity)
+            }
+            resultsArea(state, bounded: pane)
+            if let job = runner.state {
+                if flags.expandProcessing {
+                    processingBox(job, beside: true)
+                } else {
+                    processingStrip(job)
+                }
+            }
+            if !pane { Spacer(minLength: 0) }
+        }
+    }
+
+    @ViewBuilder private func recordingHeader(_ state: RunState) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if state.phase == .recording {
+                recordingRow(state)
+                let text = state.progressText
+                if !text.isEmpty {
+                    Text("Live: " + text).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                } else if prefs.live && !prefs.transcribeLater {
+                    // Until the first line there is nothing else to see of the live transcription: say what it waits for.
+                    Text(liveWaitText(state, short: false))
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Who spoke, the translation of the files, the names of the two sides and the output folder can still be changed: they apply when the recording stops."
+                     + (prefs.live && !prefs.transcribeLater ? " The languages translated live are the ones chosen when the recording started. Changing the spoken languages or the granularity now makes the final pass redo what was transcribed live." : ""))
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else if state.phase == .working {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(state.stage.isEmpty ? "Saving the recording…" : state.stage)
+                }
+            } else {
+                Text(state.outcome == .stopped ? "Recording cancelled: the audio stays in the data folder."
+                     : state.outcome == .completed ? "Recording saved." : "The recording ended with an error.")
+            }
         }
     }
 
@@ -765,8 +991,7 @@ struct ContentView: View {
             } else {
                 Text("Recording…")
             }
-            ProgressView(value: state.level).frame(width: 90)
-                .help("Microphone level: it moves while you speak")
+            LevelMeterView(meter: runner.levelMeter)
             Button(runner.recordingPaused ? "Resume" : "Pause") {
                 if runner.recordingPaused { runner.resumeRecording() } else { runner.pauseRecording() }
             }
@@ -786,41 +1011,112 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - The processing panel: the running job, then the queue
+    // MARK: - The processing job: the running job, then the queue (Session column)
 
-    @ViewBuilder private func processingSection(_ state: RunState) -> some View {
-        GroupBox(state.kind == .setup ? "Setup" : "Processing") {
+    /// No recording: the job fills the Session column (header, transcript, results and the queue).
+    @ViewBuilder private func processingSession(_ state: RunState) -> some View {
+        let pane = !state.lines.isEmpty
+        VStack(alignment: .leading, spacing: 8) {
+            GroupBox(state.kind == .setup ? "Setup" : "Processing") {
+                processingHeader(state)
+                    .padding(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if pane {
+                transcriptPane(state, session: "processing", source: .processing)
+                    .frame(minHeight: 240, maxHeight: .infinity)
+            }
+            resultsArea(state, bounded: pane, extra: true)
+            if !pane { Spacer(minLength: 0) }
+        }
+    }
+
+    /// A job beside a recording, in full (the strip expanded): its header, a short transcript, results and queue.
+    private func processingBox(_ state: RunState, beside: Bool) -> some View {
+        GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                if state.phase == .finished {
-                    if let label = runner.queue.current?.label { Text(label) }
-                } else {
-                    HStack {
-                        if let label = runner.queue.current?.label { Text(label).font(.headline) }
-                        Spacer()
-                        if state.kind != .setup {
-                            Button("Cancel") { flags.confirmCancelJob = true }
-                                .confirmationDialog("Cancel this job?", isPresented: $flags.confirmCancelJob, titleVisibility: .visible) {
-                                    Button("Cancel Job", role: .destructive) { runner.cancelProcessing() }
-                                    Button("Keep Going", role: .cancel) { }
-                                } message: {
-                                    Text("What is already done stays on disk; a transcription continues from its checkpoint when it is run again. The jobs waiting behind it go on.")
-                                }
-                        }
-                    }
+                processingHeader(state)
+                if !state.lines.isEmpty {
+                    transcriptPane(state, session: "processing", source: .processing).frame(height: 200)
                 }
-                if state.kind == .setup {
-                    if !state.stage.isEmpty { Text(state.stage) }
-                } else if state.phase == .starting {
-                    Text("Starting…")
-                } else if state.phase == .working {
-                    workRows(state)
-                }
-                if !state.lines.isEmpty { transcriptPane(state) }
-                resultRows(state)
-                if !runner.queue.pending.isEmpty { queueRows }
+                resultsArea(state, bounded: true, extra: true)
             }
             .padding(6)
             .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            HStack {
+                Text(state.kind == .setup ? "Setup" : "Processing")
+                Spacer()
+                Button(action: { flags.expandProcessing = false }) { Image(systemName: "chevron.down") }
+                    .buttonStyle(.borderless).help("Show the job as one line")
+            }
+        }
+    }
+
+    /// A job beside a recording, as one line: label, progress, ETA, Cancel, the queue's length; a click expands it.
+    private func processingStrip(_ state: RunState) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: state.kind == .translate ? "character.book.closed" : "waveform").foregroundStyle(.secondary)
+            Text(runner.queue.current?.label ?? (state.kind == .setup ? "Setup" : "Processing")).lineLimit(1).truncationMode(.middle)
+            if state.phase == .working && state.chunks > 0 {
+                ProgressView(value: state.fileFraction).frame(width: 120)
+                if let eta = state.eta { Text("ETA " + Format.rough(eta)).font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+            } else if state.phase == .finished {
+                Text(state.outcome == .completed ? "done" : "ended").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            if ContentView.pausedForLive(state.stage) {
+                StateChip(symbol: "pause.circle", text: "Paused for the live translation", color: Palette.warningText)
+                    .help(state.stage)
+            }
+            Spacer(minLength: 4)
+            if !runner.queue.pending.isEmpty {
+                Text("\(runner.queue.pending.count) waiting").font(.caption).foregroundStyle(.secondary)
+            }
+            if state.kind != .setup && state.phase != .finished { jobCancelButton }
+            Button(action: { flags.expandProcessing = true }) { Image(systemName: "chevron.up") }
+                .buttonStyle(.borderless).help("Show the job in full: its transcript, results and the queue")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// mt.py's stage while a final job waits for the live translation of a recording (one 7B translator at a time).
+    static func pausedForLive(_ stage: String) -> Bool {
+        let s = stage.lowercased()
+        return (s.hasPrefix("paused") && s.contains("live")) || s.contains("waiting for the live translation")
+    }
+
+    private var jobCancelButton: some View {
+        Button("Cancel") { flags.confirmCancelJob = true }
+            .confirmationDialog("Cancel this job?", isPresented: $flags.confirmCancelJob, titleVisibility: .visible) {
+                Button("Cancel Job", role: .destructive) { runner.cancelProcessing() }
+                Button("Keep Going", role: .cancel) { }
+            } message: {
+                Text("What is already done stays on disk; a transcription continues from its checkpoint when it is run again. The jobs waiting behind it go on.")
+            }
+    }
+
+    @ViewBuilder private func processingHeader(_ state: RunState) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if state.phase == .finished {
+                if let label = runner.queue.current?.label { Text(label) }
+            } else {
+                HStack {
+                    if let label = runner.queue.current?.label { Text(label).font(.headline) }
+                    Spacer()
+                    if state.kind != .setup { jobCancelButton }
+                }
+            }
+            if state.kind == .setup {
+                if !state.stage.isEmpty { Text(state.stage) }
+            } else if state.phase == .starting {
+                Text("Starting…")
+            } else if state.phase == .working {
+                workRows(state)
+            }
         }
     }
 
@@ -849,15 +1145,7 @@ struct ContentView: View {
             Label(note, systemImage: "exclamationmark.circle")
                 .foregroundStyle(Color.orange).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
         }
-        ForEach(Array(state.outputs.enumerated()), id: \.offset) { _, path in
-            HStack {
-                Image(systemName: "doc.text")
-                Text(URL(fileURLWithPath: path).lastPathComponent).lineLimit(1).truncationMode(.middle)
-                Spacer()
-                Button("Show") { reveal(path) }
-                Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
-            }
-        }
+        outputRows(state)
         ForEach(Array(state.errors.enumerated()), id: \.offset) { _, failure in
             Text("\(URL(fileURLWithPath: failure.file).lastPathComponent): \(failure.message)")
                 .foregroundStyle(.red).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
@@ -868,6 +1156,19 @@ struct ContentView: View {
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// The files a session wrote, each with Show and Open.
+    @ViewBuilder private func outputRows(_ state: RunState) -> some View {
+        ForEach(Array(state.outputs.enumerated()), id: \.offset) { _, path in
+            HStack {
+                Image(systemName: "doc.text")
+                Text(URL(fileURLWithPath: path).lastPathComponent).lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button("Show") { reveal(path) }
+                Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
             }
         }
     }
@@ -898,28 +1199,6 @@ struct ContentView: View {
 
     // MARK: - Transcript pane (filled line by line while mt.py works)
 
-    private static let speakerColors: [Color] = [.blue, .green, .purple, .orange, .pink, .teal, .indigo, .brown]
-
-    private func speakerColor(_ name: String) -> Color {
-        let hash = name.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0x7fffffff }
-        return ContentView.speakerColors[hash % ContentView.speakerColors.count]
-    }
-
-    private func visibleLines(_ state: RunState) -> [TranscriptLine] {
-        let needle = flags.transcriptFilter.trimmingCharacters(in: .whitespaces)
-        guard !needle.isEmpty else { return state.lines }
-        return state.lines.filter { ($0.note ?? $0.text).localizedCaseInsensitiveContains(needle) || ($0.speaker ?? "").localizedCaseInsensitiveContains(needle) }
-    }
-
-    /// The languages a translation can be shown in beside the transcript: the ones the lines carry (live, or after the
-    /// final translation) and the ones this run translates into (fixed when it started: a language ticked afterwards is
-    /// for the next job), in that order, without repeats.
-    private func translationChoices(_ state: RunState) -> [String] {
-        var seen: [String] = []
-        for name in state.lines.flatMap({ $0.tr.keys.sorted() }) + state.targets where !seen.contains(name) { seen.append(name) }
-        return seen
-    }
-
     /// What the live transcription is doing before its first line: the model loading, waiting for speech, or stopped
     /// (mt.py reports a failure as the `live` check; a note says why).
     private func liveWaitText(_ state: RunState, short: Bool) -> String {
@@ -936,28 +1215,33 @@ struct ContentView: View {
 
     /// The translations shown beside the transcript, one column each: the ones picked, else every one on offer.
     private func shownTranslations(_ state: RunState) -> [String] {
-        return TranslationColumns.shown(choices: translationChoices(state), chosen: flags.shownTranslations)
+        return TranslationColumns.shown(choices: state.translationChoices, chosen: flags.shownTranslations)
     }
 
-    @ViewBuilder private func transcriptPane(_ state: RunState) -> some View {
-        let choices = translationChoices(state)
+    @ViewBuilder private func transcriptPane(_ state: RunState, session: String, source: TelemetrySource) -> some View {
+        let choices = state.translationChoices
         let shown = shownTranslations(state)
         VStack(alignment: .leading, spacing: 4) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("Transcript so far: \(state.spokenLines) line\(state.spokenLines == 1 ? "" : "s")").font(.headline)
                 if !choices.isEmpty {
                     LanguageMenu(names: choices, selection: Binding(get: { shown }, set: { flags.shownTranslations = $0 }),
                                  none: "No translation shown", isPresented: $flags.showTranslationMenu,
                                  query: $flags.translationQuery, width: 200)
                 }
+                TranscriptChips(store: runner.telemetry, source: source)
                 Spacer()
-                TextField("Find", text: $flags.transcriptFilter).frame(width: 160)
+                TextField("Find", text: $flags.transcriptFilter).frame(width: 140)
                 Toggle("Follow", isOn: $flags.followTranscript).toggleStyle(.checkbox)
+                if !choices.isEmpty {
+                    Toggle("Timings", isOn: $layout.showTimings).toggleStyle(.checkbox)
+                        .help("Under each translation: the time it took and the model that made it")
+                }
                 Button("Copy") { copyTranscript(state) }
-                if state.phase == .finished, let folder = state.folder ?? runner.lastFolder, !speakerLabels(state).isEmpty {
+                if state.phase == .finished, let folder = state.folder ?? runner.lastFolder, !state.speakerLabelList.isEmpty {
                     Button("Name Speakers…") {
                         flags.renameFolder = folder
-                        flags.renameNames = Dictionary(uniqueKeysWithValues: speakerLabels(state).map { ($0, "") })
+                        flags.renameNames = Dictionary(uniqueKeysWithValues: state.speakerLabelList.map { ($0, "") })
                         flags.showRename = true
                     }
                 }
@@ -975,66 +1259,13 @@ struct ContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 4)
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        if state.lines.isEmpty {
-                            Text(liveWaitText(state, short: true))
-                                .font(.caption).foregroundStyle(.secondary).padding(4)
-                        }
-                        ForEach(Array(visibleLines(state).enumerated()), id: \.offset) { index, line in
-                            transcriptRow(line, translations: shown).id(index)
-                        }
-                    }
-                    .padding(4)
-                }
-                .frame(minHeight: 160, maxHeight: 360)
-                .background(Color(nsColor: .textBackgroundColor))
-                // Follow: the end of the transcript stays in view as lines come, change (the final pass refines them) and get
-                // their translations.
-                .onChange(of: state.lines) { _ in
-                    if flags.followTranscript, let last = visibleLines(state).indices.last { proxy.scrollTo(last, anchor: .bottom) }
-                }
-            }
+            TranscriptList(lines: state.lines, revision: state.revision, session: session, translations: shown,
+                           filter: flags.transcriptFilter, timings: layout.showTimings && !shown.isEmpty,
+                           follow: flags.followTranscript, reduceMotion: display.reduceMotion,
+                           emptyText: liveWaitText(state, short: true))
+                .equatable()
+                .frame(minHeight: 120, maxHeight: .infinity)
         }
-    }
-
-    /// One line: time, language, who spoke and the text, then each of `translations` beside it, all in columns of equal
-    /// width, so the columns line up from row to row under their names (an ellipsis while a live translation is still to come).
-    @ViewBuilder private func transcriptRow(_ line: TranscriptLine, translations: [String]) -> some View {
-        if let note = line.note {
-            Text("# [\(Format.duration(Int(line.t)))] \(note)")
-                .font(.system(.caption, design: .monospaced)).italic().foregroundStyle(.secondary)
-        } else {
-            HStack(alignment: .top, spacing: 6) {
-                HStack(alignment: .top, spacing: 6) {
-                    Text(Format.duration(Int(line.t))).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
-                    Text(line.tag).font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(line.tag.hasSuffix("?]") ? Color.orange : Color.secondary)
-                    if let speaker = line.speaker {
-                        Text(speaker).font(.caption.bold()).foregroundStyle(speakerColor(speaker))
-                    }
-                    Text(line.text).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        .foregroundStyle(line.live ? Color.secondary : Color.primary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                ForEach(translations, id: \.self) { language in
-                    Divider()
-                    Text(line.tr[language] ?? "…").textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        .foregroundStyle(line.tr[language] == nil ? Color.secondary : (line.live ? Color.secondary : Color.primary))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-        }
-    }
-
-    /// The numbered labels speaker separation gave ("Speaker 1", "Them 2"), in order of appearance.
-    private func speakerLabels(_ state: RunState) -> [String] {
-        var seen: [String] = []
-        for line in state.lines {
-            if let s = line.speaker, s.range(of: #"^\S.* \d+$"#, options: .regularExpression) != nil, !seen.contains(s) { seen.append(s) }
-        }
-        return seen
     }
 
     private var renameSheet: some View {

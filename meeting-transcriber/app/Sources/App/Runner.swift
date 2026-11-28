@@ -84,6 +84,30 @@ final class Runner: ObservableObject {
     private var callNote: String?          // something to tell about the call (a capture that stopped), shown with its result
     @Published private var recordingHeld = false      // the "Recording" automatic-termination hold, taken and released exactly once
 
+    // Telemetry (C5): their own ObservableObjects, plain `let`s here (not @Published), so a STAT or a LEVEL never
+    // publishes this Runner and never re-evaluates the window's transcript; only the views that show them observe them.
+    let telemetry = TelemetryStore()
+    let levelMeter = LevelMeter()
+    private let sampler = SystemSampler()
+    private var telemetryShown = LayoutPrefs.shared.showTelemetry
+    private var layoutWatch: AnyCancellable?
+    /// The recording's tracks as the telemetry names them: one microphone, or the two sides of a call.
+    @Published private(set) var recordingTrackNames: [String] = []
+
+    init() {
+        sampler.pids = { [weak self] in self?.processIDs() ?? ([], []) }
+        sampler.onReading = { [weak self] reading in
+            guard let self = self else { return }
+            self.telemetry.ingest(reading, recordingActive: self.isRecording, processingActive: self.isProcessing)
+        }
+        // The sampler runs every 2 s while something runs, every 10 s when idle with the Telemetry column shown, and not
+        // at all otherwise. $showTelemetry sends the new value before it is stored, so the value is taken from the sink.
+        layoutWatch = LayoutPrefs.shared.$showTelemetry.sink { [weak self] shown in
+            self?.telemetryShown = shown
+            self?.updateSampler()
+        }
+    }
+
     /// The recording slot is taken from Start until the recording's transcription is queued (or its end reported): the
     /// follower may still be finishing after the capture stopped, and a second recording must not touch its fields meanwhile.
     var isRecording: Bool { return recordingHeld }
@@ -245,6 +269,7 @@ final class Runner: ObservableObject {
         stopSent = false
         recordingState = RunState(kind: .record)
         recordingState?.targets = settings.translatesLive ? settings.targets : []
+        startTelemetry(settings)
         recordingSince = Date()
         pauseClock = PauseClock()
         recordingPaused = false
@@ -261,6 +286,19 @@ final class Runner: ObservableObject {
             guard let self = self else { return }
             let status = self.run(step, slot: .recording)
             DispatchQueue.main.async { self.finishRecordingProcess(status: status) }
+        }
+    }
+
+    /// A recording starts with empty telemetry and a still level meter; its tracks are named as the transcript names them.
+    private func startTelemetry(_ settings: JobSettings) {
+        telemetry.reset(recording: true)
+        levelMeter.set(0)
+        if settings.captureSystem {
+            let me = settings.meName.trimmingCharacters(in: .whitespaces)
+            let them = settings.themName.trimmingCharacters(in: .whitespaces)
+            recordingTrackNames = [me.isEmpty ? "You" : me, them.isEmpty ? "Them" : them]
+        } else {
+            recordingTrackNames = ["Microphone"]
         }
     }
 
@@ -353,6 +391,20 @@ final class Runner: ObservableObject {
     /// While a job runs the Mac must not go to sleep by itself (a closed lid still sleeps it; that is reported on wake).
     private func updateActivity() {
         if isRunning { holdActivity() } else { releaseActivity() }
+        updateSampler()
+    }
+
+    private func updateSampler() {
+        sampler.setInterval(isRunning ? 2 : (telemetryShown ? 10 : nil))
+    }
+
+    /// The pids of the recording's processes (record-only mt.py, the call's follower) and of the job's (the sampler's
+    /// queue calls this, hence the lock).
+    private func processIDs() -> (recording: [Int32], processing: [Int32]) {
+        lock.lock(); defer { lock.unlock() }
+        let recording = [recordProcess, follower].compactMap { $0?.processIdentifier }
+        let processing = [current].compactMap { $0?.processIdentifier }
+        return (recording, processing)
     }
 
     private func holdActivity() {
@@ -389,6 +441,7 @@ final class Runner: ObservableObject {
 
     private func releaseRecording() {
         guard recordingHeld else { return }
+        telemetry.end(recording: true)
         recordingHeld = false
         ProcessInfo.processInfo.enableAutomaticTermination("Recording")
     }
@@ -408,6 +461,7 @@ final class Runner: ObservableObject {
         callNote = nil
         recordingState = RunState(kind: .record)
         recordingState?.targets = settings.translatesLive ? settings.targets : []
+        startTelemetry(settings)
         recordingSince = Date()
         pauseClock = PauseClock()
         recordingPaused = false
@@ -439,7 +493,7 @@ final class Runner: ObservableObject {
         }
         rec.onLevel = { [weak self, weak rec] level in
             guard let self = self, let rec = rec, self.recorder === rec else { return }
-            if var s = self.recordingState { s.apply(.level(level)); self.recordingState = s }
+            self.levelMeter.set(level)                 // the meter alone observes it: no publish of the recording's state
         }
         let microphone = settings.microphone.isDefault ? nil : (uid: settings.microphone.uid, name: settings.microphone.label)
         let output = settings.output.isDefault ? nil : (uid: settings.output.uid, name: settings.output.label)
@@ -779,6 +833,7 @@ final class Runner: ObservableObject {
         if work.seed != nil && !isRecording { recordingState = nil }    // not a newer recording's panel
         state = work.seed ?? RunState(kind: job.kind)
         state?.targets = work.targets              // fixed when the job was queued; the form may have changed since
+        telemetry.reset(recording: false)
         ProcessInfo.processInfo.disableAutomaticTermination("Transcribing")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var status: Int32 = 0
@@ -836,11 +891,10 @@ final class Runner: ObservableObject {
 
         let handle = pipe.fileHandleForReading
         var buffer = Data()
-        var pending: [MTEvent] = []
-        func flush() {
-            guard !pending.isEmpty else { return }
-            let batch = pending
-            pending.removeAll()
+        // The events go to the main queue in batches, at most one per 100 ms (Core EventCoalescer): the final pass sends
+        // hundreds of LINE events in a second, which were as many publishes of the window. What is held is handed on by
+        // a trailing timer, or at the end of the output. The coalescer lives on its own serial queue.
+        let events = CoalescedEvents { batch in      // on its queue; main.async keeps the batches in order
             DispatchQueue.main.async { self.apply(batch, toRecording: toRecording) }
         }
         // Lines end with a newline or (progress redraws) a carriage return.
@@ -848,15 +902,16 @@ final class Runner: ObservableObject {
             let chunk = handle.availableData
             if chunk.isEmpty { break }
             buffer.append(chunk)
+            var parsed: [MTEvent] = []
             while let end = buffer.firstIndex(where: { $0 == 10 || $0 == 13 }) {
                 let line = String(decoding: buffer[buffer.startIndex..<end], as: UTF8.self)
                 buffer.removeSubrange(buffer.startIndex...end)
-                if !line.isEmpty { pending.append(EventParser.parse(line)) }
+                if !line.isEmpty { parsed.append(EventParser.parse(line)) }
             }
-            flush()                      // events are rare (one per chunk or file), so no throttling is needed
+            if !parsed.isEmpty { events.add(parsed) }
         }
-        if !buffer.isEmpty { pending.append(EventParser.parse(String(decoding: buffer, as: UTF8.self))) }
-        flush()
+        let tail: [MTEvent] = buffer.isEmpty ? [] : [EventParser.parse(String(decoding: buffer, as: UTF8.self))]
+        events.finish(tail)                          // delivered before the caller's main.async of the end
         p.waitUntilExit()
         lock.lock()
         switch slot {
@@ -869,6 +924,12 @@ final class Runner: ObservableObject {
     }
 
     private func apply(_ events: [MTEvent], toRecording: Bool = false) {
+        // STAT to the telemetry, LEVEL to the meter: neither changes RunState, so a batch of only those publishes nothing here.
+        let routed = EventRouting.split(events)
+        if !routed.stats.isEmpty { telemetry.ingest(routed.stats, toRecording: toRecording) }
+        if toRecording, let level = routed.level { levelMeter.set(level) }
+        let events = routed.state
+        guard !events.isEmpty else { return }
         if toRecording {
             guard var s = recordingState else { return }
             for e in events { s.apply(e) }
@@ -888,6 +949,7 @@ final class Runner: ObservableObject {
 
     private func finish(status: Int32, job: QueuedJob) {
         ProcessInfo.processInfo.enableAutomaticTermination("Transcribing")
+        telemetry.end(recording: false)
         state?.finish(exitStatus: status, stopRequested: stopRequested)
         works[job.id] = nil
         queue.finishCurrent()
@@ -919,5 +981,43 @@ final class Runner: ObservableObject {
         showOutcomeAlert = true
         updateActivity()
         pump()
+    }
+}
+
+/// The events of one process's output, handed on in batches of at most one per 100 ms (Core EventCoalescer). The
+/// coalescer lives on its own serial queue: `add` and `finish` (called by the reading thread) wait for it, and the
+/// trailing flush runs on it.
+private final class CoalescedEvents {
+    private let queue = DispatchQueue(label: "Meeting Transcriber events", qos: .userInitiated)
+    private var coalescer = EventCoalescer(interval: 0.1)
+    private var timerArmed = false
+    private let deliver: ([MTEvent]) -> Void
+
+    init(deliver: @escaping ([MTEvent]) -> Void) {
+        self.deliver = deliver
+    }
+
+    func add(_ events: [MTEvent]) {
+        queue.sync { offer(events) }
+    }
+
+    /// The end of the output: everything held, then `tail`, at once.
+    func finish(_ tail: [MTEvent]) {
+        queue.sync {
+            let rest = coalescer.drain() + tail
+            if !rest.isEmpty { deliver(rest) }
+        }
+    }
+
+    private func offer(_ events: [MTEvent]) {        // on `queue`
+        let now = ProcessInfo.processInfo.systemUptime
+        if let batch = coalescer.add(events, now: now) { deliver(batch) }
+        if !timerArmed, let due = coalescer.nextDue(now: now) {
+            timerArmed = true
+            queue.asyncAfter(deadline: .now() + due) { [self] in
+                timerArmed = false
+                offer([])
+            }
+        }
     }
 }

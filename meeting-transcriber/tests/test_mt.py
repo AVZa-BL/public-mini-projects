@@ -1,3 +1,5 @@
+import collections
+import functools
 import json
 import os
 import re
@@ -1154,6 +1156,46 @@ def test_an_outro_said_again_and_again_is_withdrawn_from_the_live_window_and_lef
     final = capsys.readouterr().out.splitlines()
     assert not any(o.startswith("@@LINE\t") and outro in o for o in final), "the final pass never shows a withdrawn copy again"
     assert "@@CLEAR" not in final, "nothing it shows is left out at its end: no need to start the window over"
+
+
+def test_a_withdrawn_outro_is_not_sent_again_by_its_late_translation(monkeypatch, tmp_path, capsys):
+    """The outro test above with a translation into English whose Claude requests answer only after the CLEAR: the
+    translation (or the tr_skip at the stop) of a copy withdrawn since it was queued sends no @@LINE for it again."""
+    _content_vad(monkeypatch)
+    outro = "Bitte abonnieren."
+    engine = ScriptEngine({0: outro, 1: "Hello.", 8: "Добрый день.", 16: outro, 24: outro})
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    release = threading.Event()
+
+    class SlowAnthropic:                       # a Claude request that answers only once released
+        def __init__(self):
+            self.messages = self
+
+        def create(self, **kw):
+            release.wait(20)
+            n = kw["messages"][0]["content"].split("\n\n", 1)[1].count("\n") + 1
+            return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(text="\n".join(f"{i}|T{i}" for i in range(n)))])
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=SlowAnthropic, APIConnectionError=OSError))
+    mine = _speech(34, gaps=set(range(34)) - {0, 1, 8, 9, 16, 17, 24, 25})
+    theirs = _speech(34, gaps=set(range(34)) - {1, 2})
+    one, two = _live_track(tmp_path, "", tmp_path / "mine.wav"), _live_track(tmp_path, ".2", tmp_path / "theirs.wav")
+    one.feed(mine)
+    two.feed(theirs)
+    worker = mt.LiveWorker([one, two], targets=["English"], offline=False)
+    worker.start()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and (len(one.chunks) < 4 or one.pending or two.pending):
+        time.sleep(0.05)
+    time.sleep(0.5)
+    release.set()                              # the first request answers after the CLEAR
+    time.sleep(1.5)
+    worker.stop(wait=10)
+    out = capsys.readouterr().out.splitlines()
+    clear = out.index("@@CLEAR")
+    after = [json.loads(o.split("\t", 1)[1]) for o in out[clear:] if o.startswith("@@LINE\t")]
+    assert after and not [l for l in after if l["text"] == outro], "a withdrawn copy is never shown again"
+    assert any(l.get("tr") or l.get("tr_skip") for l in after), "the other lines' translations (or skips) still follow"
 
 
 def test_a_live_track_neither_shows_nor_translates_a_videos_outro_and_screens_as_a_recording(monkeypatch, capsys):
@@ -2314,6 +2356,8 @@ def test_stop_does_not_wait_for_a_speech_model_that_is_still_loading(monkeypatch
     assert time.monotonic() - t0 < 2 and track.closed
     assert "@@NOTE\tThe speech model was still loading when the recording stopped" in capsys.readouterr().out
     release.set()
+    worker.thread.join(5)                      # its @@STAT model (the load done) is sent here, not into a later test
+    assert not worker.thread.is_alive()
 
 
 def test_live_track_keeps_only_the_audio_its_chunks_still_need(monkeypatch, tmp_path):
@@ -3010,17 +3054,21 @@ def test_record_live_translates_each_line_as_it_appears_and_the_final_pass_reuse
                 self.second += 1
     monkeypatch.setitem(sys.modules, "sounddevice", SimpleNamespace(InputStream=PatternStream))
     monkeypatch.setattr(mt, "load_audio", lambda src, track=None: __import__("soundfile").read(str(src), dtype="float32")[0])
-    monkeypatch.setattr(sys, "argv", ["mt.py", "record", "--hours", str(24 / 3600), "--live", "--language", "en", "--granularity", "coarse",
+    # 40 s at 10x real time: the first chunk (0-15 s) is decoded and translated while recording. Since 1.13.0 a chunk
+    # decoded after the stop is not translated live (the stop leaves the translation to the final pass): it is sent
+    # once more with tr_skip instead.
+    monkeypatch.setattr(sys, "argv", ["mt.py", "record", "--hours", str(40 / 3600), "--live", "--language", "en", "--granularity", "coarse",
                                       "--to", "Russian", "--offline"])
     mt.main()
     out = capsys.readouterr().out.splitlines()
     lines = [json.loads(o.split("\t", 1)[1]) for o in out if o.startswith("@@LINE\t")]
     live = [l for l in lines if l.get("live")]
-    shown_first = [l for l in live if "tr" not in l]
+    shown_first = [l for l in live if "tr" not in l and "tr_skip" not in l]
     translated = [l for l in live if "tr" in l]
     assert shown_first and translated, "a line is shown at once, then again with its translation"
     assert all(l["tr"] == {"Russian": "T" + l["text"]} and l["tr_offline"] for l in translated)
-    assert all(any(t["t"] == s["t"] for t in translated) for s in shown_first), "every live line got its translation"
+    assert all(any(t["t"] == s["t"] for t in translated) or any(k["t"] == s["t"] and k["tr_skip"] == ["Russian"] for k in live if "tr_skip" in k)
+               for s in shown_first), "every live line got its translation, or is marked as left to the final pass"
     folder = next(p for p in tmp_path.iterdir() if p.is_dir())
     doc = json.loads((folder / "transcript.json").read_text())
     stored = [l for l in doc["lines"] if "tr" in l]                  # the tail is translated at the end, not on its lines
@@ -3037,15 +3085,18 @@ def test_live_translation_with_claude_and_a_failure_that_ends_it_with_a_note(mon
     monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
     lines = [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "Привет"}, {"t": 1.0, "note": "x"}, {"t": 2.0, "lang": "ru", "conf": 1.0, "text": "Пока"}]
     worker = mt.LiveWorker([], targets=["English", "German"])
-    worker.translate(lines)
+    worker.translate(lines)                                                  # 1.13.0: queued, made by the worker's steps
+    _drain_translator(worker)
     assert lines[0]["tr"] == {"English": "T0", "German": "T0"} and lines[2]["tr"] == {"English": "T1", "German": "T1"}
     assert "tr" not in lines[1] and lines[0]["tr_offline"] is False
 
     def broken(*a, **k):
         raise RuntimeError("no network")
-    monkeypatch.setattr(mt, "translate_live", broken)
+    monkeypatch.setattr(mt, "claude_translate", broken)                      # the request itself fails (on the helper thread)
     worker.translate(lines)
+    _drain_translator(worker)
     worker.translate(lines)
+    _drain_translator(worker)
     assert worker.translation_off and capsys.readouterr().out.count("@@NOTE\tLive translation stopped (RuntimeError: no network)") == 1
 
 
@@ -3379,6 +3430,15 @@ class FakeGemmaTokenizer:
         return [len(self.messages) - 1] * 10
 
 
+def _gemma_module(generate):
+    """An mlx_lm stand-in from a generate(): stream_generate yields its reply in two parts (1.13.0 streams)."""
+    def stream_generate(model, tokenizer, prompt, **kw):
+        out = generate(model, tokenizer, prompt, **kw)
+        yield SimpleNamespace(text=out[:3], finish_reason=None)
+        yield SimpleNamespace(text=out[3:], finish_reason="stop")
+    return SimpleNamespace(generate=generate, stream_generate=stream_generate)
+
+
 def _fake_gemma(monkeypatch, reply=lambda item: f"<{item['target_lang_code']}>{item['text']}"):
     tok = FakeGemmaTokenizer()
     calls = []
@@ -3387,7 +3447,13 @@ def _fake_gemma(monkeypatch, reply=lambda item: f"<{item['target_lang_code']}>{i
         item = tokenizer.messages[prompt[0]]
         calls.append((item, max_tokens))
         return reply(item)
-    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(generate=generate, load=lambda repo: ("model", tok)))
+
+    def stream_generate(model, tokenizer, prompt, max_tokens=256, **kw):      # 1.13.0 streams; generate() is its concatenation
+        out = generate(model, tokenizer, prompt, max_tokens, **kw)
+        yield SimpleNamespace(text=out[:3], finish_reason=None)
+        yield SimpleNamespace(text=out[3:], finish_reason="stop")
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(generate=generate, stream_generate=stream_generate,
+                                                                load=lambda repo: ("model", tok)))
     monkeypatch.setattr(mt, "_load_gemma", lambda: ("model", tok))
     monkeypatch.setattr(mt, "release_engine", lambda: None)
     monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
@@ -3431,8 +3497,9 @@ def test_translating_a_meeting_with_gemma_sends_the_templates_message_and_gives_
 
 def test_the_stop_token_is_added_and_a_leaked_end_of_turn_is_cut(monkeypatch):
     tok = FakeGemmaTokenizer()
-    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(load=lambda repo: ("model", tok),
-                                                               generate=lambda *a, **k: "Hello<end_of_turn>junk"))
+    module = _gemma_module(lambda *a, **k: "Hello<end_of_turn>junk")
+    module.load = lambda repo: ("model", tok)
+    monkeypatch.setitem(sys.modules, "mlx_lm", module)
     monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=lambda *a, **k: "/m"))
     mt._load_gemma.cache_clear()
     monkeypatch.setattr(mt, "release_engine", lambda: None)
@@ -3465,11 +3532,11 @@ def test_a_gemma_translation_cut_short_goes_on_from_its_log(monkeypatch, tmp_pat
             raise KeyboardInterrupt                                          # the run is stopped after two lines
         seen.append(item["text"])
         return "EN " + item["text"]
-    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(generate=lambda m, t, prompt, **k: reply(t.messages[prompt[0]])))
+    monkeypatch.setitem(sys.modules, "mlx_lm", _gemma_module(lambda m, t, prompt, **k: reply(t.messages[prompt[0]])))
     with pytest.raises(KeyboardInterrupt):
         mt.translate({"lines": lines, "translations": {}}, "English", offline=True, checkpoint=tmp_path)
     seen.clear()
-    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(generate=lambda m, t, prompt, **k: "EN " + t.messages[prompt[0]]["text"]))
+    monkeypatch.setitem(sys.modules, "mlx_lm", _gemma_module(lambda m, t, prompt, **k: "EN " + t.messages[prompt[0]]["text"]))
     calls_before = len(tok.messages)
     out = mt.translate({"lines": lines, "translations": {}}, "English", offline=True, checkpoint=tmp_path)
     assert out == [f"EN строка {k}" for k in range(4)] and len(tok.messages) - calls_before == 2, "only the last two were sent"
@@ -3569,16 +3636,22 @@ def test_live_translation_waits_for_the_download_then_loads_the_model_on_the_wor
     monkeypatch.setattr(mt, "model_present", lambda repo: False)
     monkeypatch.setattr(mt, "fetch_model", lambda repo, size, stage=True: gate.wait(5))
     worker = mt.LiveWorker([], targets=["English"], offline=True)
-    threading.Thread(target=worker.fetch_models, daemon=True).start()       # what run() starts when the model is missing
+    # What run() starts (1.13.0): the prepare thread downloads the missing model, then loads NLLB (a CPU model) itself;
+    # the worker's thread (this one here) only queues and steps, and never waits.
+    prepare = threading.Thread(target=worker.translator.prepare, daemon=True)
+    prepare.start()
     first = [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "privet"}]
     worker.translate(first)
-    assert "tr" not in first and loaded_on == [], "nothing waits: the line is translated at the end"
+    assert not worker.step()
+    assert "tr" not in first and loaded_on == [], "nothing waits for the download"
     assert "starts once the translation model is downloaded" in capsys.readouterr().err
     gate.set()
     worker.models_here.wait(5)
+    prepare.join(5)
     second = [{"t": 1.0, "lang": "ru", "conf": 1.0, "text": "poka"}]
     worker.translate(second)
-    assert second[0]["tr"] == {"English": "Tpoka"} and loaded_on and loaded_on[0] == threading.get_ident()
+    _drain_translator(worker)
+    assert second[0]["tr"] == {"English": "Tpoka"} and loaded_on == [prepare.ident], "loaded once, on the prepare thread"
 
 
 def test_gemma_with_a_target_it_lacks_and_with_an_nllb_that_cannot_load(monkeypatch, capsys):
@@ -3873,7 +3946,7 @@ def test_a_wrong_hy_file_is_not_downloaded_again_on_the_live_workers_thread(monk
     notes = []
     monkeypatch.setattr(mt, "note", notes.append)
     worker = mt.LiveWorker([], targets=["English"], offline=True)
-    worker.models_here.set()
+    worker.translator.prepare()                                             # 1.13.0: the check runs on the prepare thread
     worker.translate([{"text": "привет", "lang": "ru"}])
     assert calls == [(False, False)] and worker.translation_off
     assert notes and "could not be loaded" in notes[0] and "downloaded again when the recording is translated" in notes[0]
@@ -4244,7 +4317,7 @@ def test_the_windows_path_check_counts_the_hy_log(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_model_downloads(monkeypatch, request):
+def _no_model_downloads(monkeypatch, request, tmp_path_factory):
     """No test downloads a translation model: the cache is taken as holding them (Hy-MT3's pinned files too), and a fetch
     does nothing (the tests of fetching and checking Hy-MT3 put the real functions back, from _REAL). The stream
     switch of mlx-lm needs the real MLX (it was run against MLX 0.29.3, 0.31.2, 0.32.0 and 0.32.4); it is left out except
@@ -4257,6 +4330,20 @@ def _no_model_downloads(monkeypatch, request):
     monkeypatch.setattr(mt, "_NLLB_FAILED", [])
     if "gets_a_stream_of_its_own" not in request.node.name:
         monkeypatch.setattr(mt, "_thread_stream", lambda: None)
+    # 1.13.0: the lock files of one test are its own (the LLM slot, the live marker), a live model handed over or files
+    # checked in one test are not seen by the next, and the machine counts as one with memory enough for a 7B model live
+    # (a 16 GB runner reports a little less than 16 GiB, below TranslateGemma's threshold).
+    monkeypatch.setattr(mt, "LOCK_DIR", str(tmp_path_factory.mktemp("locks")))
+    slot, want = mt.FileLock("llm.lock"), mt.FileLock("llm-want.lock")
+    monkeypatch.setattr(mt, "_SLOT", slot)
+    monkeypatch.setattr(mt, "_WANT", want)
+    monkeypatch.setattr(mt, "_LIVE_MODEL", {})
+    monkeypatch.setattr(mt, "_HY_FILES_CHECKED", {})
+    if "memory" not in request.node.name:
+        monkeypatch.setattr(mt, "total_memory", lambda: 64 * 2**30)
+    yield
+    slot.free()
+    want.free()
 
 
 def test_each_thread_that_generates_gets_a_stream_of_its_own_in_the_mlx_lm_module(monkeypatch):
@@ -4283,3 +4370,1080 @@ def test_each_thread_that_generates_gets_a_stream_of_its_own_in_the_mlx_lm_modul
     assert module.generation_stream == "stream-2" and len(made) == 2 and made[1] != made[0]
     real()                                                                    # back on this thread: its own again
     assert module.generation_stream == "stream-3"
+
+
+# ---------- 1.13.0: the live transcript never waits for a translation ----------
+class _Events:
+    """Stands in for mt.ev: every event with the monotonic time it was sent at (thread-safe)."""
+    def __init__(self):
+        self.items, self.lock = [], threading.Lock()
+
+    def __call__(self, kind, *fields):
+        with self.lock:
+            self.items.append((time.monotonic(), kind, fields))
+
+    def of(self, kind):
+        with self.lock:
+            return [(at, fields) for at, k, fields in self.items if k == kind]
+
+    def lines(self):
+        return [(at, json.loads(f[0])) for at, f in self.of("LINE")]
+
+    def stats(self, kind=None):
+        return [(at, f[0], json.loads(f[1])) for at, f in self.of("STAT") if kind is None or f[0] == kind]
+
+
+class TwoLineEngine:
+    """Decodes a chunk into two lines named after the second it starts at (speech samples carry their second + 1)."""
+    name = "fake"
+
+    def __init__(self, cost=0.0):
+        self.calls, self.cost = [], cost
+
+    def analyse(self, chunk, detect=True):
+        return SimpleNamespace(chunk=chunk, probs=[("ru", 0.99)] if detect else None)
+
+    def decode(self, state, language):
+        import numpy as np
+        if self.cost:
+            time.sleep(self.cost)
+        first = int(np.asarray(state.chunk)[np.flatnonzero(state.chunk)[0]] * 32768) - 1
+        self.calls.append(first)
+        return [{"start": 0.0, "end": 1.0, "text": f"c{first} one", "logprob": -0.1},
+                {"start": 1.0, "end": 2.0, "text": f"c{first} two", "logprob": -0.3}]
+
+
+def _live_hy(monkeypatch, tmp_path, token_s=0.0, tokens=1, load_s=0.0, fetch_s=0.0, slices=1, slice_s=0.0):
+    """A stand-in Hy-MT3 for the live worker, at mlx-lm's narrowest points: stream_generate yields `tokens` tokens of
+    `token_s` each; the pinned files' check (fetch_hy) takes fetch_s; the model's load takes load_s at once (the 1.12.0
+    path, _load_hy) or `slices` slices of slice_s (the 1.13.0 path: load_model(lazy=True), then eval_in_slices).
+    Returns (abort, seen): set abort to end every generation at once; seen records where things ran."""
+    tok = FakeHyTokenizer()
+    abort = threading.Event()
+    seen = {"fetch_threads": [], "generate_threads": [], "load_lazy": [], "requests": 0}
+    files = {"model.safetensors": str(tmp_path / "hy" / "model.safetensors"), "tokenizer.json": str(tmp_path / "hy" / "tokenizer.json")}
+    (tmp_path / "hy").mkdir(exist_ok=True)
+    (tmp_path / "hy" / "model.safetensors").write_bytes(b"\0" * 4096)
+    (tmp_path / "hy" / "config.json").write_text(json.dumps({"eos_token_id": [127960]}))
+
+    def stream_generate(model, tokenizer, prompt, max_tokens=256, **kw):
+        seen["requests"] += 1
+        seen["generate_threads"].append(threading.get_ident())
+        for k in range(tokens):
+            if abort.is_set():
+                yield SimpleNamespace(text="", finish_reason="stop")
+                return
+            if token_s:
+                time.sleep(token_s)
+            yield SimpleNamespace(text="<tr>" if k == 0 else "x", finish_reason=None if k < tokens - 1 else "stop")
+
+    def load_model(path, lazy=False):
+        seen["load_lazy"].append(lazy)
+        if not lazy and load_s:
+            time.sleep(load_s)
+        return "model", {"eos_token_id": [127960]}
+
+    def load_tokenizer(path, tokenizer_config_extra=None, eos_token_ids=None):
+        return tok
+
+    def fetch_hy(stage=True, refetch=True):
+        seen["fetch_threads"].append(threading.get_ident())
+        if fetch_s:
+            time.sleep(fetch_s)
+        return files
+
+    def old_load_hy():                                                       # 1.12.0: the whole load at once
+        if load_s:
+            time.sleep(load_s)
+        return "model", tok
+
+    def eval_in_slices(model, slice_bytes=None):
+        for k in range(slices):
+            if slice_s:
+                time.sleep(slice_s)
+            yield (k + 1) * 100, slices * 100
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(stream_generate=stream_generate))
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", SimpleNamespace(make_logits_processors=lambda **kw: []))
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", SimpleNamespace(load_model=load_model, load_tokenizer=load_tokenizer))
+    monkeypatch.setattr(mt, "_load_hy", old_load_hy)
+    monkeypatch.setattr(mt, "fetch_hy", fetch_hy)
+    monkeypatch.setattr(mt, "eval_in_slices", eval_in_slices, raising=False)
+    monkeypatch.setattr(mt, "release_engine", lambda: None)
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    monkeypatch.setattr(mt, "HY", mt.HY_DEFAULT)
+    return abort, seen
+
+
+def _chunk_of_speech(second, speech=6, pause=2):
+    """int16 audio of `speech` seconds of speech (each second carries second + 1) and then `pause` seconds of silence."""
+    import numpy as np
+    audio = np.concatenate([np.full(16000, s + 1, dtype="int16") for s in range(second, second + speech)]
+                           + [np.zeros(16000 * pause, dtype="int16")])
+    return audio.reshape(-1, 1)
+
+
+def _live_worker(monkeypatch, tmp_path, engine, targets):
+    _content_vad(monkeypatch)
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    events = _Events()
+    monkeypatch.setattr(mt, "ev", events)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    track = mt.LiveTrack("x.wav", tmp_path, "", tmp_path / "x.wav", ["ru"], "normal", None, mt.engine_name())
+    worker = mt.LiveWorker([track], targets=targets, offline=True)
+    return worker, track, events
+
+
+def _drain_translator(worker, timeout=10):
+    """Steps the worker (on this thread, as its own thread would) until its translator has nothing left to do."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if worker.step():
+            continue
+        if not worker.translator.has_work():
+            return
+        time.sleep(0.001)                                                     # a request on the helper thread
+    raise AssertionError("the translator did not finish")
+
+
+def _wait_for(condition, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
+
+
+def test_live_transcript_is_not_held_up_by_a_slow_translation(monkeypatch, tmp_path):
+    """T1. 1.12.0 translated every line of a chunk into every target on the decode thread before it looked at the next
+    chunk (8 s a line and target here: the second chunk came 16-32 s late). Now the second chunk's lines come within
+    CUT_EVERY_S plus one token of its pause being fed, whatever the translation costs."""
+    abort, seen = _live_hy(monkeypatch, tmp_path, token_s=0.02, tokens=400)
+    worker, track, events = _live_worker(monkeypatch, tmp_path, TwoLineEngine(), ["English", "German"])
+    worker.start()
+    try:
+        track.feed(_chunk_of_speech(0))                                       # speech 0-6 s, then 2 s of pause
+        assert _wait_for(lambda: any(l.get("text") == "c0 one" for _, l in events.lines()), 5), "the first chunk is shown"
+        assert _wait_for(lambda: seen["requests"] > 0, 10), "and its translation has started"
+        track.feed(_chunk_of_speech(8))                                       # the second chunk and its pause
+        fed_at = time.monotonic()
+        assert _wait_for(lambda: any(l.get("text") == "c8 one" for _, l in events.lines()), 20), "the second chunk is shown"
+        shown_at = next(at for at, l in events.lines() if l.get("text") == "c8 one")
+        assert shown_at - fed_at <= 1.5, f"the second chunk waited {shown_at - fed_at:.1f} s for the translation"
+    finally:
+        abort.set()
+        worker.stop(wait=30)
+
+
+def test_the_first_model_load_does_not_stop_the_transcript(monkeypatch, tmp_path):
+    """T2. 1.12.0 checked the pinned files and loaded Hy-MT3 on the decode thread at the first chunk with text: the
+    transcript stopped for the whole load. Now the check runs on the prepare thread and the weights are evaluated in
+    slices between chunks: the lines keep coming at the pace they come without translation, and @@STAT model goes
+    checking -> loading (progress rising) -> ready with its load time."""
+    def run(targets):
+        _, seen = _live_hy(monkeypatch, tmp_path, load_s=2.0, fetch_s=2.0, slices=20, slice_s=0.1)
+        worker, track, events = _live_worker(monkeypatch, tmp_path, TwoLineEngine(), targets)
+        worker.start()
+        try:
+            for k in range(12):                                               # a chunk every 0.5 s (speech 14x real time)
+                track.feed(_chunk_of_speech(8 * k))
+                time.sleep(0.5)
+            _wait_for(lambda: len([l for _, l in events.lines() if "text" in l and "tr" not in l]) >= 24, 5)
+        finally:
+            worker.stop(wait=30)
+        firsts = {}
+        for at, l in events.lines():
+            if "text" in l:
+                firsts.setdefault(l["text"], at)
+        times = sorted(firsts.values())
+        return max(b - a for a, b in zip(times, times[1:])), events, seen, worker
+    plain_gap, _, _, _ = run([])
+    gap, events, seen, worker = run(["English"])
+    assert gap <= plain_gap + 1.5, f"a gap of {gap:.1f} s between two lines (without translation {plain_gap:.1f} s)"
+    assert seen["fetch_threads"] and worker.thread.ident not in seen["fetch_threads"], "the files are checked off the worker's thread"
+    states = [s["state"] for _, _, s in events.stats("model") if s.get("role") == "translator"]
+    assert "checking" in states and "loading" in states and states[-1] in ("ready", "stopped", "released"), states
+    assert states.index("checking") < states.index("loading") < states.index("ready")
+    progress = [s["progress"] for _, _, s in events.stats("model") if s.get("state") == "loading" and "progress" in s]
+    assert progress == sorted(progress) and progress[-1] == 1.0
+    ready = next(s for _, _, s in events.stats("model") if s.get("state") == "ready" and s.get("role") == "translator")
+    assert ready["load_ms"] >= 2000
+
+
+class _VirtualEngine:
+    """Decodes a chunk into the lines of the utterances in it: utterance u carries the sample value u + 1, and gives a
+    line every `seg` seconds (as Whisper gives a segment), named after it, so the lines do not depend on how the speech
+    was cut into chunks. Each decode costs `cost` seconds of the virtual clock."""
+    name = "fake"
+
+    def __init__(self, clock, cost, seg=6.0):
+        self.clock, self.cost, self.seg, self.calls = clock, cost, seg, 0
+
+    def analyse(self, chunk, detect=True):
+        return SimpleNamespace(chunk=chunk, probs=[("ru", 0.99)] if detect else None)
+
+    def decode(self, state, language):
+        import numpy as np
+        self.clock[0] += self.cost
+        self.calls += 1
+        values = np.rint(np.asarray(state.chunk) * 32768).astype(int)
+        segs = []
+        for u in sorted(set(values[values > 0].tolist())):
+            where = np.flatnonzero(values == u)
+            start, end = where[0] / 16000, (where[-1] + 1) / 16000
+            n = max(1, int(round((end - start) / self.seg)))
+            step = (end - start) / n
+            segs.extend({"start": start + k * step, "end": start + (k + 1) * step, "text": f"u{u - 1}-{k}", "logprob": -0.2}
+                        for k in range(n))
+        return segs
+
+
+def _virtual_speech(minutes, tracks=1, seed=1, short=(3, 12), gap=(0.8, 2.0)):
+    """The lag driver's synthetic meeting: utterances of 3-12 s, pauses of 0.8-2 s (a call's other side answers 60 % of
+    the time). Returns the int16 audio per track (utterance u carries u + 1) and the utterances (track, start, end)."""
+    import random
+    import numpy as np
+    rnd = random.Random(seed)
+    total = int(minutes * 60)
+    audio = [np.zeros(total * 16000, dtype="int16") for _ in range(tracks)]
+    pos, who, said = 0.5, 0, []
+    while pos < total - 1:
+        end = min(total - 0.5, pos + rnd.uniform(*short))
+        audio[who][int(pos * 16000):int(end * 16000)] = len(said) + 1
+        said.append((who, pos, end))
+        pos = end + rnd.uniform(*gap)
+        if tracks == 2 and rnd.random() < 0.6:
+            who = 1 - who
+    return audio, said
+
+
+def _virtual_live(monkeypatch, tmp_path, minutes=10.0, d=0.3, t=6.0, tokens=30, targets=2, tracks=1, mode="hy", seg=6.0,
+                  short=(3, 12), gap=(0.8, 2.0), seed=1):
+    """T3's harness: the real LiveTrack, LiveWorker and LiveTranslator on a virtual clock, driven step by step on this
+    thread. Before each step() the audio up to clock() is fed; a decode costs d, a Hy-MT3 request t (tokens tokens of
+    t / tokens each), an NLLB batch t; an idle step costs 0.1 s. Then the stop: the drain on the same clock. Returns a
+    dict of what was shown and when (virtual seconds)."""
+    clock = [0.0]
+    _content_vad(monkeypatch)
+    events = []
+    monkeypatch.setattr(mt, "ev", lambda kind, *fields: events.append((clock[0], kind, fields)))
+    monkeypatch.setattr(mt, "EVENTS", True)
+    engine = _VirtualEngine(clock, d, seg)
+    tok = FakeHyTokenizer()
+
+    def stream_generate(model, tokenizer, prompt, max_tokens=256, **kw):
+        for k in range(tokens):
+            clock[0] += t / tokens
+            yield SimpleNamespace(text="<tr>" if k == 0 else "x", finish_reason=None if k < tokens - 1 else "stop")
+
+    class Batches(FakeTranslator):
+        def translate_batch(self, tokens_, target_prefix, **kw):
+            clock[0] += t
+            return super().translate_batch(tokens_, target_prefix, **kw)
+    nllb = (Batches(), FakeTokenizer())
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(stream_generate=stream_generate))
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", SimpleNamespace(make_logits_processors=lambda **kw: []))
+    monkeypatch.setattr(mt, "llm_live_parts", lambda stopped=None: SimpleNamespace(path=tmp_path, tok=tok, bytes=100))
+    monkeypatch.setattr(mt, "llm_live_model", lambda path: "model")
+    monkeypatch.setattr(mt, "eval_in_slices", lambda model, slice_bytes=None: iter([(100, 100)]))
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: nllb)
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy" if mode == "hy" else "nllb")
+    audio, said = _virtual_speech(minutes, tracks, seed, short, gap)
+    names = ["You", "Them"]
+    live_tracks = [mt.LiveTrack(f"t{k}.wav", tmp_path, f".{k + 1}" if tracks > 1 else "", tmp_path / f"t{k}.wav", ["ru"], "normal",
+                                names[k] if tracks > 1 else None, mt.engine_name()) for k in range(tracks)]
+    langs = ["English", "German"][:targets] if mode != "none" else []
+    worker = mt.LiveWorker(live_tracks, targets=langs, offline=True)
+    worker.clock = lambda: clock[0]
+    worker.engine = engine
+    worker.translator.engine = engine
+    worker.translator.started_at = 0.0
+    worker.translator.prepare()                                              # its thread, run here: deterministic
+    n, fed = len(audio[0]), 0
+
+    def feed(upto):
+        nonlocal fed
+        upto = min(n, upto)
+        if upto > fed:
+            for k, track in enumerate(live_tracks):
+                track.feed(audio[k][fed:upto].reshape(-1, 1))
+            fed = upto
+    while fed < n:
+        feed(int(clock[0] * 16000))
+        if not worker.step():
+            clock[0] += 0.1
+    stop_at = clock[0]
+    pending_at_stop = sum(len(tr.pending) for tr in live_tracks)
+    worker.stop_flag.set()
+    worker.drain()
+    for track in live_tracks:
+        track.close()
+    shown, translated, skipped = {}, {}, {}
+    for at, kind, fields in events:
+        if kind != "LINE":
+            continue
+        line = json.loads(fields[0])
+        if "text" not in line:
+            continue
+        key = (line.get("speaker"), line["text"])
+        shown.setdefault(key, (at, line["end"]))
+        for target in line.get("tr", {}):
+            translated.setdefault((key, target), at)
+        for target in line.get("tr_skip", []):
+            skipped.setdefault((key, target), at)
+    stats = [(at, f[0], f[1]) for at, k, f in events if k == "STAT"]
+    return dict(shown=shown, translated=translated, skipped=skipped, stats=stats, targets=langs, stop_at=stop_at,
+                drain_s=clock[0] - stop_at, pending_at_stop=pending_at_stop, d=d, events=events, worker=worker,
+                engine=engine, tracks=live_tracks)
+
+
+def _lags(run):
+    return {key: at - end for key, (at, end) in run["shown"].items()}
+
+
+def _check_bounds(run, plain, token_s):
+    """The bounds of G1 and G2 (spec A1) on one virtual run against the same audio without translation."""
+    import numpy as np
+    lag, lag0 = _lags(run), _lags(plain)
+    assert set(lag0) <= set(lag), "every line of the run without translation is shown with it too"
+    worst = max(lag[k] - lag0[k] for k in lag0)
+    assert worst <= mt.CUT_EVERY_S + max(token_s, 0.2) + 1e-6, f"a line came {worst:.2f} s later than without translation"
+    def slope(r, lags):
+        late = sorted((end, lags[k]) for k, (_, end) in r["shown"].items() if r["stop_at"] - 300 <= end < r["stop_at"])
+        return float(np.polyfit([e for e, _ in late], [l for _, l in late], 1)[0]) * 60 if len(late) > 3 else 0.0
+    # The lag must not grow with the meeting's length. Measured against the same audio without translation: that run's
+    # own slope over the last 5 minutes is noise of up to 0.18 s a minute (seed 1), so the slope is compared with it.
+    grows, base = slope(run, lag), slope(plain, lag0)
+    assert grows <= base + 0.25, f"the lag grows by {grows:.2f} s a minute over the last 5 minutes ({base:.2f} without translation)"
+    for (key, target), at in run["translated"].items():
+        shown_at, end = run["shown"][key]
+        # G2: at most LIVE_TR_BEHIND_S + the longest job (6 s) + CUT_EVERY_S after the line was shown (a line of a 30 s
+        # chunk is shown late already: its translation is measured from then).
+        assert at - shown_at <= mt.LIVE_TR_BEHIND_S + 6 + mt.CUT_EVERY_S + 1e-6, (key, target, at - shown_at, at - end)
+    for key in run["shown"]:
+        for target in run["targets"]:
+            assert (key, target) in run["translated"] or (key, target) in run["skipped"], (key, target)
+    return worst
+
+
+def test_live_lag_stays_bounded_when_translation_cannot_keep_up(monkeypatch, tmp_path):
+    """T3. The worst row of the lag driver (1.12.0: lag 256 s median, growing 46 s a minute): 10 minutes of speech,
+    0.3 s a chunk, Hy-MT3 6 s a line and target (30 tokens of 0.2 s), two targets, so the translation alone would need
+    1.7 times the audio. The transcript keeps its pace (each line at most CUT_EVERY_S plus one token later than without
+    translation, no growth), each line translated live comes at most 30 s + one job + CUT_EVERY_S after it was shown,
+    the rest is marked for the final pass, and the stop does not wait for the translation."""
+    plain = _virtual_live(monkeypatch, tmp_path / "plain", mode="none")
+    run = _virtual_live(monkeypatch, tmp_path / "hy")
+    _check_bounds(run, plain, 0.2)
+    kinds = [kind for _, kind, _ in run["stats"]]
+    skips = [json.loads(f) for _, k, f in run["stats"] if k == "trskip"]
+    assert any(s["reason"] in ("behind", "duty") for s in skips), "the translator skipped to the newest chunk"
+    assert any(json.loads(f)["state"] == "behind" for _, k, f in run["stats"] if k == "queue")
+    assert run["translated"], "and translated live what it could"
+    assert run["drain_s"] <= (run["pending_at_stop"] + 1) * run["d"] + 1e-6, "the drain decodes, it does not translate"
+    if run["pending_at_stop"] or "trskip" in kinds:
+        assert any(s["reason"] == "stop" for s in skips) or not run["worker"].translator.queue
+
+
+def test_stat_events_are_small_valid_json_and_never_per_token(monkeypatch, tmp_path):
+    """T12, on a 4-minute run of T3's harness."""
+    run = _virtual_live(monkeypatch, tmp_path, minutes=4)
+    events = run["events"]
+    stats = [(at, f) for at, k, f in events if k == "STAT"]
+    assert stats
+    for at, (kind, body) in stats:
+        assert len(("@@STAT\t" + kind + "\t" + body).encode("utf-8")) <= 1024, body
+        assert isinstance(json.loads(body), dict) and kind in {"chunk", "tr", "trskip", "queue", "model", "sys"}
+    by_kind = collections.Counter(kind for _, (kind, _) in stats)
+    assert by_kind["tr"] <= len(run["shown"]) * len(run["targets"]), "at most one per line and target: never per token"
+    queue_at = [at for at, (kind, _) in stats if kind == "queue"]
+    assert max(sum(1 for b in queue_at if a <= b < a + 1) for a in queue_at) <= 2, "queue: at most 2 a second"
+    sys_at = [at for at, (kind, _) in stats if kind == "sys"]
+    assert sys_at and all(b - a >= mt.STAT_SYS_EVERY_S - 1e-6 for a, b in zip(sys_at, sys_at[1:])), "sys: every 2 s at most"
+
+
+def test_a_stat_line_with_long_non_ascii_strings_stays_within_1024_bytes(monkeypatch):
+    """A8: strings are cut at 200 characters, but 200 non-ASCII characters are up to 800 bytes: a model folder and an
+    error in Japanese are shortened further so that the whole line is at most 1024 bytes, and it is still valid JSON."""
+    monkeypatch.setattr(mt, "EVENTS", True)
+    events = _Events()
+    monkeypatch.setattr(mt, "ev", events)
+    mt.stat("model", role="translator", name="/Users/ユーザー/モデル/" + "翻訳" * 100, engine="mlx", state="failed",
+            error="RuntimeError: " + "モデルを読み込めません" * 30)
+    mt.stat("trskip", reason="behind", lines=3, targets=["ポルトガル語（ブラジル）" * 3] * 40, total=10)
+    mt.stat("queue", state="ready", jobs=0)
+    for kind, body in [f for _, f in events.of("STAT")]:
+        assert len(("@@STAT\t" + kind + "\t" + body).encode("utf-8")) <= 1024
+        fields = json.loads(body)
+        assert fields["state" if kind != "trskip" else "reason"]
+    model = json.loads(events.of("STAT")[0][1][1])
+    assert model["name"].startswith("/Users/ユーザー/") and model["error"].startswith("RuntimeError: ")
+    assert json.loads(events.of("STAT")[2][1][1]) == {"state": "ready", "jobs": 0}, "a short line is left as it is"
+
+
+def test_a_jobs_model_download_says_how_much_is_downloaded(monkeypatch):
+    """The app turns tqdm's bars off (HF_HUB_DISABLE_PROGRESS_BARS): a job's download sends its STAGE again with the
+    GB so far instead; during a recording (stage=False) the live translator's @@STAT model does that, not a STAGE."""
+    monkeypatch.setattr(mt, "EVENTS", True)
+    events = _Events()
+    monkeypatch.setattr(mt, "ev", events)
+    monkeypatch.setattr(mt, "DOWNLOAD_STAGE_EVERY_S", 0.02)
+    monkeypatch.setattr(mt, "fetch_model", _REAL.fetch_model)
+    monkeypatch.setattr(mt, "model_present", lambda repo: False)
+    monkeypatch.setattr(mt, "hf_partial_bytes", lambda repos: 3 * 2**29)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=lambda repo: time.sleep(0.2)))
+    mt.fetch_model("org/some-model", "about 1 GB")
+    stages = [f[0] for _, f in events.of("STAGE")]
+    first = "Fetching the translation model org/some-model first (once, about 1 GB), so that it is here when it is needed"
+    assert stages[0] == first and first + ": 1.5 GB so far" in stages[1:]
+    count = len(stages)
+    time.sleep(0.1)
+    assert len(events.of("STAGE")) == count, "none after the download"
+    events.items.clear()
+    mt.fetch_model("org/some-model", "about 1 GB", stage=False)
+    assert not events.of("STAGE")
+
+
+def test_lines_that_aged_while_the_slot_was_held_elsewhere_are_skipped_as_slot(monkeypatch):
+    """B2's trskip reasons: a job that aged while the translator waited for another process's slot says 'slot'; one that
+    aged while the translator was ready says 'behind'."""
+    monkeypatch.setattr(mt, "EVENTS", True)
+    events = _Events()
+    monkeypatch.setattr(mt, "ev", events)
+    worker = mt.LiveWorker([], targets=["English"], offline=False)
+    clock = [100.0]
+    worker.clock = lambda: clock[0]
+    tr = worker.translator
+    for state, reason in (("waiting", "slot"), ("ready", "behind")):
+        events.items.clear()
+        tr.state = state
+        tr.queue = [mt._Job("claude", "English", [{"t": 1.0, "text": "Да"}], None, None, 1, 50.0)]
+        tr._skip_to_newest(clock[0])
+        skips = [json.loads(f[1]) for _, f in events.of("STAT") if f[0] == "trskip"]
+        assert [s["reason"] for s in skips] == [reason] and not tr.queue
+
+
+def test_a_wrong_mlx_cache_size_is_a_warning_not_a_crash(capsys):
+    assert mt._cache_mb(None) == 1024 and mt._cache_mb("512") == 512 and mt._cache_mb("0") == 0
+    assert mt._cache_mb("1g") == 1024 and "MT_MLX_CACHE_MB='1g'" in capsys.readouterr().err
+
+
+def test_a_translation_models_load_does_not_count_toward_the_duty_cap():
+    """The load's slices are the worker's time (duty_tr) but not the trailing minute's duty: the jobs that waited during
+    a long load are not held back (and skipped as 'duty') by it once the model is ready."""
+    worker = mt.LiveWorker([], targets=["English"], offline=False)
+    clock = [100.0]
+    worker.clock = lambda: clock[0]
+    tr = worker.translator
+    tr.add_busy(40.0, duty=False)                      # 60 s of load slices
+    assert tr.duty(clock[0]) == 0.0 and tr.take_busy() == 60.0
+    tr.add_busy(90.0)                                  # 10 s of translation
+    assert tr.duty(clock[0]) == 10.0 and tr.take_busy() == 10.0
+
+
+def test_a_request_still_running_at_the_stop_does_not_keep_the_process_from_ending(tmp_path):
+    """A Claude request (or a CPU NLLB batch) on the helper thread after the stop: the process ends without waiting
+    for it (its result is not wanted; a ThreadPoolExecutor's thread would be joined at the exit)."""
+    import subprocess
+    code = ("import sys, time; sys.path.insert(0, %r); import mt\n"
+            "tr = mt.LiveWorker([], targets=['English'], offline=False).translator\n"
+            "f = tr._executor().submit(time.sleep, 30)\n"
+            "time.sleep(0.2); tr.halt(); assert f.running()\n") % str(Path(mt.__file__).parent)
+    t0 = time.monotonic()
+    done = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=dict(os.environ, MT_HOME=str(tmp_path)),
+                          timeout=25, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert time.monotonic() - t0 < 15
+    helper = mt._DaemonHelper("test-helper")
+    ok, bad = helper.submit(lambda a, b: a + b, 1, 2), helper.submit(lambda: 1 / 0)
+    assert ok.result(5) == 3 and isinstance(bad.exception(5), ZeroDivisionError)
+    helper.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("row", [
+    dict(mode="none", t=0), dict(mode="nllb", t=0.2, targets=1), dict(mode="nllb", t=0.2, targets=2),
+    dict(t=1, targets=1), dict(t=1, targets=2), dict(t=3, targets=1), dict(t=3, targets=2), dict(t=6, targets=1),
+    dict(t=6, targets=2), dict(t=3, targets=2, tracks=2), dict(t=6, targets=2, tracks=2),
+    dict(t=1.5, targets=1, seg=3.0, short=(2, 6), gap=(0.4, 1.0)), dict(t=2, targets=1, seg=3.0, short=(2, 6), gap=(0.4, 1.0)),
+    dict(t=4, targets=1, seg=3.0, short=(2, 6), gap=(0.4, 1.0))],
+    ids=lambda r: "-".join(f"{k}{v}" for k, v in r.items() if k not in ("short", "gap")))
+def test_live_lag_grid(monkeypatch, tmp_path, row):
+    """T4: the rows of the lag driver's grid (telemetry/lag/summary.tsv), 6 minutes each: none; NLLB-like (0.2 s a
+    batch); Hy-MT3 1/3/6 s a line with 1-2 targets; a call (2 tracks) at 3/6 s; a dense meeting at 1.5/2/4 s. The bound
+    of T3 on every row, and with the translation needing at most 0.7 of the audio's time, no skip at all."""
+    row = dict(row)
+    tokens = 30 if row.get("mode", "hy") == "hy" else 1
+    common = {k: row[k] for k in ("tracks", "seg", "short", "gap") if k in row}
+    plain = _virtual_live(monkeypatch, tmp_path / "plain", minutes=6, mode="none", **common)
+    run = _virtual_live(monkeypatch, tmp_path / "run", minutes=6, tokens=tokens, **row)
+    token_s = row["t"] / tokens if row.get("mode", "hy") == "hy" else row["t"]
+    _check_bounds(run, plain, token_s)
+    lines_per_s = len(plain["shown"]) / (6 * 60)
+    rho = lines_per_s * row["t"] * row.get("targets", 0) if row.get("mode", "hy") == "hy" else 0.0
+    if rho <= 0.7:
+        assert not [1 for _, k, f in run["stats"] if k == "trskip" and json.loads(f)["reason"] != "stop"], f"rho {rho:.2f}: no skip"
+
+
+def test_stop_leaves_translation_to_the_final_pass_and_caps_the_drain(monkeypatch, tmp_path):
+    """T5. 20 chunks still to decode at the stop, 6 s each: the drain ends after LIVE_DRAIN_S of (virtual) time, and the
+    chunks it did not get to are decoded by the final pass, each chunk once."""
+    import numpy as np
+    clock = [0.0]
+    _content_vad(monkeypatch)
+    monkeypatch.setattr(mt, "EVENTS", False)
+    engine = _VirtualEngine(clock, 6.0)
+    audio = np.concatenate([np.concatenate([np.full(16000 * 6, k + 1, dtype="int16"), np.zeros(16000 * 2, dtype="int16")])
+                            for k in range(20)] + [np.zeros(16000 * 3, dtype="int16")])     # utterance k: 6 s, then a pause
+    track = mt.LiveTrack("x.wav", tmp_path, "", tmp_path / "x.wav", ["ru"], "normal", None, mt.engine_name())
+    worker = mt.LiveWorker([track], targets=["English"], offline=False)
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
+    worker.clock = lambda: clock[0]
+    worker.engine = engine
+    track.feed(audio.reshape(-1, 1))
+    worker.step()                                                            # one chunk decoded, its translation queued
+    assert len(track.pending) == 19 and worker.translator.queue
+    started = clock[0]
+    worker.stop_flag.set()
+    worker.drain()
+    track.close()
+    assert clock[0] - started <= mt.LIVE_DRAIN_S + 1e-6, clock[0] - started
+    live_calls = engine.calls
+    assert 1 < live_calls < 20 and track.pending, "the drain stopped at its cap"
+    assert worker.translator.stopped and not worker.translator.queue
+    engine.cost = 0.0
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    monkeypatch.setattr(mt, "load_audio", lambda src, track=None: audio.astype("float32") / 32768)
+    lines = mt.transcribe_lines(tmp_path / "x.wav", "ru", granularity="normal", checkpoint=tmp_path)
+    assert engine.calls == 20, "the final pass decoded exactly the chunks the live run left"
+    assert [l["text"] for l in lines if "text" in l] == [f"u{k}-0" for k in range(20)], "every chunk once, in order"
+
+
+def _hy_translate_1_12(items, tgt, model, tok):
+    """hy_translate as 1.12.0 had it (mt.py at bb8d15c), one stream_generate per piece run to its end: the reference
+    the stepped path must equal."""
+    from mlx_lm import stream_generate
+    from mlx_lm.sample_utils import make_logits_processors
+    decoding = dict(logits_processors=make_logits_processors(repetition_penalty=1.05, repetition_context_size=20))
+    out, cut = [], 0
+    for src, text in items:
+        done, short = [], False
+        for p in mt._pieces(text, mt.HY_PIECE):
+            ids = tok.apply_chat_template([{"role": "user", "content": mt.hy_prompt(p, tgt)}], add_generation_prompt=True)
+            budget = mt.hy_budget(len(tok.encode(p, add_special_tokens=False)), tgt)
+            reply, finish = "", None
+            for r in stream_generate(model, tok, prompt=ids, max_tokens=budget, **decoding):
+                reply += r.text
+                finish = r.finish_reason
+            short = short or finish == "length"
+            done.append(reply.split("<|eos|>")[0].strip() or p)
+        cut += short
+        out.append(("" if tgt in mt.HY_NO_SPACES else " ").join(done))
+    return out, cut
+
+
+def _token_model(monkeypatch, calls, limit_words=None):
+    """A deterministic token stream: the reply to a prompt is its text's words upper-cased, four tokens each, then
+    <|eos|>; at max_tokens it stops with "length". Every request is recorded (prompt text, max_tokens, options)."""
+    def stream_generate(model, tokenizer, prompt, max_tokens=256, **kw):
+        text = tokenizer.prompts[prompt[0]].rsplit("\n\n", 1)[-1] if hasattr(tokenizer, "prompts") else \
+            tokenizer.messages[prompt[0]]["text"]
+        calls.append((text, max_tokens, sorted(kw)))
+        words = [w.upper() + " " for w in text.split() for _ in range(4)] + ["<|eos|>"]     # 4 tokens a word
+        n = min(len(words), max_tokens)
+        for k in range(n):
+            yield SimpleNamespace(text=words[k], finish_reason=None if k < n - 1 else "length" if n < len(words) else "stop")
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(stream_generate=stream_generate,
+                                                                generate=lambda m, t, prompt, **kw: "".join(r.text for r in stream_generate(m, t, prompt, **kw))))
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", SimpleNamespace(make_logits_processors=lambda **kw: ["penalty"]))
+
+
+def _live_translate(monkeypatch, tmp_path, lines, targets, tok):
+    """The live path on its own: a LiveWorker whose prepare and load are stand-ins, the lines queued as LiveTrack.decode
+    queues them, and the worker's steps run here until the translator is idle."""
+    monkeypatch.setattr(mt, "llm_live_parts", lambda stopped=None: SimpleNamespace(path=tmp_path, tok=tok, bytes=1))
+    monkeypatch.setattr(mt, "llm_live_model", lambda path: "model")
+    monkeypatch.setattr(mt, "eval_in_slices", lambda model, slice_bytes=None: iter([(1, 1)]))
+    worker = mt.LiveWorker([], targets=targets, offline=True)
+    worker.translator.prepare()
+    worker.translate(lines)
+    _drain_translator(worker)
+    return worker
+
+
+def test_stepped_hy_and_gemma_give_the_one_shot_text(monkeypatch, tmp_path):
+    """T6. The live worker steps Hy-MT3 one token at a time between two decodes; its text, its count of lines cut at the
+    token limit and its requests (same prompts, budgets and options, in the same order for a line) are those of
+    1.12.0's one-shot hy_translate. Pieces and the limit included; TranslateGemma likewise against generate()."""
+    calls = []
+    _token_model(monkeypatch, calls)
+    tok = FakeHyTokenizer()
+    monkeypatch.setattr(mt, "_load_hy", lambda: ("model", tok))
+    monkeypatch.setattr(mt, "release_engine", lambda: None)
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    long = " ".join(f"Sentence number {k} is here." for k in range(120))       # in pieces
+    texts = ["привет как дела", long, ("слово " * 300).strip()]               # the last runs to its token limit
+    items = [("ru", t) for t in texts]
+    reference, ref_calls = _hy_translate_1_12(items, "en", "model", tok), list(calls)
+    assert reference[1] >= 1, "the stand-in does run to the token limit"
+    calls.clear()
+    assert mt.hy_translate(items, "en") == reference and calls == ref_calls
+    stepped = []
+    for src, text in items:
+        gen = mt.hy_steps(src, text, "en", "model", tok)
+        steps = 0
+        while True:
+            try:
+                next(gen)
+                steps += 1
+            except StopIteration as done:
+                stepped.append(done.value)
+                break
+        assert steps > 1, "one step per token"
+    assert [t for t, _ in stepped] == reference[0] and sum(c for _, c in stepped) == reference[1]
+    calls.clear()
+    lines = [{"t": float(k), "end": float(k) + 1, "lang": "ru", "conf": 1.0, "text": t} for k, t in enumerate(texts)]
+    _live_translate(monkeypatch, tmp_path, lines, ["English"], tok)
+    assert [l["tr"]["English"] for l in lines] == reference[0] and calls == ref_calls, "the live path: the same text, the same requests"
+    assert all(l["tr_by"] == {"English": mt.HY} and l["tr_of"] == l["text"] and l["tr_offline"] for l in lines)
+    # TranslateGemma: 1.12.0 called generate(), whose body in mlx-lm 0.29.1 is the concatenation of stream_generate's text.
+    gtok = FakeGemmaTokenizer()
+    monkeypatch.setattr(mt, "_load_gemma", lambda: ("model", gtok))
+    monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
+    calls.clear()
+    one_shot = []
+    for src, text in items[:2]:
+        done = []
+        for p in mt._pieces(text, mt.GEMMA_PIECE):
+            msgs = [{"role": "user", "content": [{"type": "text", "source_lang_code": src, "target_lang_code": "en", "text": p}]}]
+            ids = gtok.apply_chat_template(msgs, add_generation_prompt=True)
+            reply = sys.modules["mlx_lm"].generate("model", gtok, prompt=ids, max_tokens=min(2048, 2 * len(ids) + 64))
+            done.append(reply.split("<end_of_turn>")[0].strip() or p)
+        one_shot.append(" ".join(done))
+    ref_calls = list(calls)
+    calls.clear()
+    assert mt.gemma_translate(items[:2], "en") == one_shot and calls == ref_calls
+    calls.clear()
+    glines = [{"t": float(k), "end": float(k) + 1, "lang": "ru", "conf": 1.0, "text": t} for k, t in enumerate(texts[:2])]
+    _live_translate(monkeypatch, tmp_path, glines, ["English"], gtok)
+    assert [l["tr"]["English"] for l in glines] == one_shot and calls == ref_calls
+
+
+class _PatternStream(FakeStream):
+    """3 s of speech, 1 s of silence, 10x real time (as the record --live tests have it)."""
+    def __init__(self, samplerate, channels, dtype, device, callback):
+        super().__init__(samplerate, channels, dtype, device, callback)
+        self.second = 0
+
+    def _run(self):
+        import numpy as np
+        while not self.stop_flag.is_set():
+            s = self.second
+            self.block = np.full((1600, 1), 0 if s % 4 == 3 else s + 1, dtype="int16")
+            for _ in range(10):
+                if self.stop_flag.is_set():
+                    break
+                self.callback(self.block, 1600, None, None)
+                time.sleep(0.01)
+            self.second += 1
+
+
+def _record_live_only(monkeypatch, tmp_path, capsys, targets):
+    """`record --no-transcribe --live` of 40 s (10x real time) with live translation into `targets` (offline, NLLB
+    stand-in), as the app runs it; then the queued `transcribe --into` with the same targets. Returns (folder, the
+    records of the live checkpoint, the first run's events, the second run's events)."""
+    pytest.importorskip("soundfile")
+    _content_vad(monkeypatch)
+    engine = SecondEngine()
+    translator = FakeTranslator()
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: (translator, FakeTokenizer()))
+    monkeypatch.setattr(mt, "preflight", lambda *a, **k: None)
+    monkeypatch.setattr(mt, "DATA", tmp_path)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    monkeypatch.setitem(sys.modules, "sounddevice", SimpleNamespace(InputStream=_PatternStream))
+    monkeypatch.setattr(mt, "load_audio", lambda src, track=None: __import__("soundfile").read(str(src), dtype="float32")[0])
+    to = [arg for t in targets for arg in ("--to", t)]
+    monkeypatch.setattr(sys, "argv", ["mt.py", "record", "--hours", str(40 / 3600), "--no-transcribe", "--live", "--name", "standup",
+                                      "--language", "en", "--granularity", "coarse", *to, "--offline"])
+    mt.main()
+    first = capsys.readouterr().out.splitlines()
+    folder = next(p for p in tmp_path.iterdir() if p.is_dir())
+    records = [json.loads(r) for r in (folder / "partial.jsonl").read_text().splitlines()]
+    monkeypatch.setattr(sys, "argv", ["mt.py", "transcribe", str(folder / "audio.wav"), "--into", str(folder), "--out", str(folder),
+                                      "--stem", "standup", "--language", "en", "--granularity", "coarse", *to, "--offline"])
+    mt.main()
+    second = capsys.readouterr().out.splitlines()
+    return folder, records, first, second
+
+
+def test_live_translations_are_byte_identical_to_the_one_shot_path_and_reused_at_the_end(monkeypatch, tmp_path, capsys):
+    """T7. A line translated live has the text and tr_by the one-shot path gives it; the last checkpoint record of its
+    chunk carries it; the final pass reuses it ("translated live") and writes it into the file unchanged."""
+    folder, records, first, second = _record_live_only(monkeypatch, tmp_path, capsys, ["Russian"])
+    last = {}
+    for rec in records:
+        last[rec["i"]] = rec["lines"]
+    live = [l for lines in last.values() for l in lines if "tr" in l]
+    assert live, "a chunk was translated while recording and written again with it"
+    for line in live:
+        fresh = {k: v for k, v in line.items() if k not in ("tr", "tr_of", "tr_by", "tr_offline")}
+        assert line["tr"] == {"Russian": mt.translate_texts([fresh], "Russian", True)[0]} and line["tr_of"] == line["text"]
+        assert line["tr_by"] == {"Russian": mt.line_translator(line.get("lang"), "Russian", True)} and line["tr_offline"] is True
+    assert any(o.startswith("@@NOTE\tTranslated") and "translated live" in o for o in second)
+    text = (folder / "standup.Russian.txt").read_text()
+    assert all(line["tr"]["Russian"] in text for line in live)
+
+
+def test_telemetry_fields_are_only_in_events(monkeypatch, tmp_path, capsys):
+    """T13. tr_ms, tr_skip and dec_ms are sent in events only: never in transcript.json, the checkpoint or a text file."""
+    folder, records, first, second = _record_live_only(monkeypatch, tmp_path, capsys, ["Russian"])
+    assert any("tr_ms" in o for o in first) and any(o.startswith("@@STAT\tchunk\t") and "dec_ms" in o for o in first)
+    assert not any(k in json.dumps(records) for k in ("tr_ms", "tr_skip", "dec_ms")), "not in the live checkpoint"
+    for path in folder.iterdir():
+        if path.is_file() and path.suffix in (".json", ".jsonl", ".txt"):
+            body = path.read_text(encoding="utf-8")
+            assert not any(k in body for k in ("tr_ms", "tr_skip", "dec_ms", "@@STAT")), path.name
+
+
+def test_live_scheduling_adds_no_note(monkeypatch, tmp_path, capsys):
+    """T13. The app puts every NOTE at the top of the transcript: the scheduler's messages (behind, paused, the
+    model's states) go to stderr and @@STAT, so a recording translated live has the notes of one that is not."""
+    _, _, plain_first, plain_second = _record_live_only(monkeypatch, tmp_path / "plain", capsys, [])
+    _, _, first, second = _record_live_only(monkeypatch, tmp_path / "live", capsys, ["Russian"])
+    notes = lambda out: [o for o in out if o.startswith("@@NOTE\t")]
+    assert notes(first) == notes(plain_first), "no note while recording"
+    extra = [n for n in notes(second) if n not in notes(plain_second)]
+    assert all(n.startswith("@@NOTE\tTranslated ") for n in extra), extra
+
+
+_REAL_THREAD_STREAM = mt._thread_stream
+_REAL_EVAL_IN_SLICES = mt.eval_in_slices
+
+
+def test_every_mlx_call_of_a_live_run_is_on_the_worker_thread(monkeypatch, tmp_path):
+    """T8. One thread owns the GPU: a stand-in mlx.core records the thread of every eval, new_stream, set_cache_limit,
+    synchronize and clear_cache of a live run with Hy-MT3 (the engine on the GPU, the weights evaluated in slices, the
+    generation stream switched): there is one, the worker's. The prepare thread (files, tokenizer, page cache) makes none."""
+    import threading as th
+    used = collections.defaultdict(set)
+
+    def record(name, result=None):
+        def call(*a, **k):
+            used[name].add(th.get_ident())
+            return result
+        return call
+    mx = SimpleNamespace(eval=record("eval"), new_stream=record("new_stream", "stream"), default_device=lambda: "gpu",
+                         set_cache_limit=record("set_cache_limit"), synchronize=record("synchronize"),
+                         clear_cache=record("clear_cache"))
+    params = {"layers": [SimpleNamespace(nbytes=200 << 20) for _ in range(5)]}
+
+    class Model:
+        def parameters(self):
+            return params
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=mx))
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    monkeypatch.setitem(sys.modules, "mlx.utils", SimpleNamespace(tree_flatten=lambda tree: [(str(k), a) for k, a in enumerate(tree["layers"])]))
+    abort, seen = _live_hy(monkeypatch, tmp_path, token_s=0.005, tokens=20, fetch_s=0.2)
+    monkeypatch.setattr(mt, "eval_in_slices", _REAL_EVAL_IN_SLICES)
+    monkeypatch.setattr(mt, "llm_live_model", lambda path: Model())
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", SimpleNamespace(generation_stream="made at import"))
+    monkeypatch.setattr(mt, "_STREAM_THREAD", [])
+    monkeypatch.setattr(mt, "_thread_stream", _REAL_THREAD_STREAM)
+    engine = TwoLineEngine()
+    engine.name, engine.mx = "mlx", mx
+    worker, track, events = _live_worker(monkeypatch, tmp_path, engine, ["English"])
+    worker.start()
+    try:
+        for k in range(4):
+            track.feed(_chunk_of_speech(8 * k))
+            time.sleep(0.3)
+        assert _wait_for(lambda: any("tr" in l for _, l in events.lines()), 10), "translated live"
+    finally:
+        worker.stop(wait=30)
+    assert used["eval"] and used["set_cache_limit"] and used["new_stream"], dict(used)
+    assert set().union(*used.values()) == {worker.thread.ident}, {k: v for k, v in used.items()}
+    assert seen["fetch_threads"] and worker.thread.ident not in seen["fetch_threads"]
+    assert set(seen["generate_threads"]) == {worker.thread.ident}
+
+
+def test_the_weights_are_evaluated_in_slices_of_at_most_256_mb(monkeypatch):
+    """eval_in_slices: one mx.eval per slice of at most LOAD_SLICE_BYTES (a tensor bigger than that is a slice of its
+    own), every array once, the progress rising to the total."""
+    evals = []
+    mx = SimpleNamespace(eval=lambda *arrays: evals.append(arrays))
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=mx))
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    sizes = [100, 100, 100, 300, 50, 10, 10]
+    arrays = [SimpleNamespace(nbytes=s << 20) for s in sizes]
+    monkeypatch.setitem(sys.modules, "mlx.utils", SimpleNamespace(tree_flatten=lambda tree: list(enumerate(tree))))
+    model = SimpleNamespace(parameters=lambda: arrays)
+    progress = list(_REAL_EVAL_IN_SLICES(model))
+    assert [sum(a.nbytes for a in group) >> 20 for group in evals] == [200, 100, 300, 70]
+    assert [a for group in evals for a in group] == arrays and progress[-1] == (sum(sizes) << 20, sum(sizes) << 20)
+    assert [d for d, _ in progress] == sorted(d for d, _ in progress)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock: the LLM slot and the live marker do nothing on Windows")
+def test_one_llm_on_the_machine_and_the_final_job_hands_over(monkeypatch, tmp_path, capsys):
+    """T9. Two holders of the LLM slot in one process (flock belongs to an open file description, so they exclude each
+    other as two processes do). A final job translates 10 lines with Hy-MT3; a live recording asks for the slot during
+    it: the job lets the model go after its current line, says "Paused…", the recording gets the slot, and once the
+    recording gives it back the job reloads and goes on from its log, with no line twice."""
+    tok, calls, _ = _fake_hy(monkeypatch)
+    loads = []
+
+    @functools.lru_cache(maxsize=1)                                           # cached as the real one is (release_hy clears it)
+    def load():
+        loads.append(1)
+        return "model", tok
+    monkeypatch.setattr(mt, "_load_hy", load)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    events = _Events()
+    monkeypatch.setattr(mt, "ev", events)
+    started = threading.Event()
+    real_generate = sys.modules["mlx_lm"].stream_generate
+
+    def slow(*a, **k):
+        if len(calls) == 2:
+            started.set()                                                     # the job is at its third line
+        time.sleep(0.05)
+        yield from real_generate(*a, **k)
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(stream_generate=slow))
+    doc = {"lines": [{"t": float(k), "lang": "ru", "conf": 1.0, "text": f"строка {k}"} for k in range(10)], "translations": {}}
+    out = []
+    job = threading.Thread(target=lambda: out.append(mt.translate(doc, "English", offline=True, checkpoint=tmp_path)))
+    job.start()
+    assert started.wait(5)
+    live_want, live_slot = mt.FileLock("llm-want.lock"), mt.FileLock("llm.lock")   # what a live recording holds
+    assert live_want.try_take()
+    deadline = time.monotonic() + 10
+    while not live_slot.try_take():
+        assert time.monotonic() < deadline, "the job never handed the slot over"
+        time.sleep(0.02)
+    live_want.free()
+    translated_when_live_got_it = len(calls)
+    time.sleep(0.3)
+    assert len(calls) == translated_when_live_got_it, "the job waits while the recording has the model"
+    assert any(f == ("Paused: the recording in progress translates live (one translation model at a time)",)
+               for _, f in events.of("STAGE"))
+    live_slot.free()                                                          # the recording ended
+    job.join(10)
+    assert out and out[0] == [f"<English>строка {k}" for k in range(10)]
+    assert len(loads) == 2, "loaded again after the hand-over"
+    log = next((tmp_path / "translations").glob("*.jsonl"))
+    done = [json.loads(r)["i"] for r in log.read_text().splitlines()]
+    assert sorted(done) == list(range(10)) and len(done) == 10, "every line once in the log"
+    assert len(calls) == 10, "no line translated twice"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock: the LLM slot and the live marker do nothing on Windows")
+def test_a_job_waits_for_the_slot_a_live_recording_holds(monkeypatch, tmp_path):
+    """A final job that finds the slot held at its start says so and waits for it."""
+    tok, calls, _ = _fake_hy(monkeypatch)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    events = _Events()
+    monkeypatch.setattr(mt, "ev", events)
+    live_slot = mt.FileLock("llm.lock")
+    assert live_slot.try_take()
+    out = []
+    job = threading.Thread(target=lambda: out.append(mt.hy_translate([("ru", "да")], "en")))
+    job.start()
+    time.sleep(0.3)
+    assert not out and ("Waiting for the live translation of the recording in progress",) in [f for _, f in events.of("STAGE")]
+    live_slot.free()
+    job.join(5)
+    assert out == [(["<English>да"], 0)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock: the LLM slot and the live marker do nothing on Windows")
+def test_a_job_waits_while_a_live_recording_waits_for_the_free_slot(monkeypatch, tmp_path):
+    """A final job that starts while a live recording waits for the slot (llm-want.lock held, llm.lock free) does not
+    take it before the recording: it waits until the recording has it, then until the recording lets it go."""
+    tok, calls, _ = _fake_hy(monkeypatch)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    events = _Events()
+    monkeypatch.setattr(mt, "ev", events)
+    live_want, live_slot = mt.FileLock("llm-want.lock"), mt.FileLock("llm.lock")
+    assert live_want.try_take()
+    out = []
+    job = threading.Thread(target=lambda: out.append(mt.hy_translate([("ru", "да")], "en")))
+    job.start()
+    time.sleep(0.3)
+    assert not out and not calls and ("Waiting for the live translation of the recording in progress",) in [
+        f for _, f in events.of("STAGE")]
+    assert live_slot.try_take(), "the slot is still free for the recording"
+    live_want.free()
+    time.sleep(0.8)
+    assert not out, "the recording has the slot: the job waits for it"
+    live_slot.free()
+    job.join(5)
+    assert out == [(["<English>да"], 0)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock: the LLM slot and the live marker do nothing on Windows")
+def test_a_job_that_holds_the_slot_already_does_not_wait_for_a_waiting_recording(monkeypatch):
+    """After a hand-over the job takes the slot back and loads its model again: take_llm_slot then returns at once,
+    also when a recording waits for the slot (waiting there, holding it, would be a deadlock)."""
+    monkeypatch.setattr(mt, "_SLOT", mt.FileLock("llm.lock"))
+    assert mt._SLOT.try_take()
+    live_want = mt.FileLock("llm-want.lock")
+    assert live_want.try_take()
+    done = threading.Event()
+    threading.Thread(target=lambda: (mt.take_llm_slot(), done.set()), daemon=True).start()
+    try:
+        assert done.wait(2), "returned at once"
+    finally:
+        live_want.free()
+        mt._SLOT.free()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock: the LLM slot and the live marker do nothing on Windows")
+def test_the_live_marker_is_held_although_a_job_probes_it_at_that_instant():
+    """A job's live_running() holds live.lock exclusively for an instant: a recording that starts then still holds
+    its marker (it waits for the probe), so the job yields to it."""
+    probe = mt.FileLock("live.lock")
+    assert probe.try_take()
+    threading.Timer(0.2, probe.free).start()
+    marker = mt.live_marker()
+    try:
+        assert marker.held and mt.live_running()
+    finally:
+        marker.free()
+    assert not mt.live_running()
+
+
+def test_without_fcntl_the_slot_and_the_marker_do_nothing(monkeypatch):
+    """Windows has no fcntl (and no TranslateGemma or Hy-MT3): every slot is free, no recording counts as live."""
+    monkeypatch.setitem(sys.modules, "fcntl", None)                           # import fcntl raises ImportError
+    a, b = mt.FileLock("llm.lock"), mt.FileLock("llm.lock")
+    assert a.try_take() and b.try_take() and not mt.live_running() and not mt.live_waiting()
+    a.free()
+    b.free()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock: the LLM slot and the live marker do nothing on Windows")
+def test_a_final_job_yields_the_gpu_while_a_recording_runs(monkeypatch, tmp_path):
+    """T10. With live.lock held (a live recording runs), a processing job sleeps after each chunk as long as the chunk
+    took, at most 2 s; without it, never."""
+    import numpy as np
+    pauses = []
+    monkeypatch.setattr(mt, "_pause", pauses.append)
+    _content_vad(monkeypatch)
+    engine = TwoLineEngine(cost=0.05)
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    audio = np.concatenate([_chunk_of_speech(8 * k).reshape(-1) for k in range(3)]).astype("float32") / 32768
+    monkeypatch.setattr(mt, "load_audio", lambda src, track=None: audio)
+    mt.transcribe_lines(tmp_path / "x.wav", "ru", granularity="normal")
+    assert pauses == [], "no recording: no pause"
+    marker = mt.live_marker()
+    try:
+        mt.transcribe_lines(tmp_path / "x.wav", "ru", granularity="normal")
+        assert len(pauses) == 3 and all(0.05 <= p < 0.5 for p in pauses), pauses
+        pauses.clear()
+        assert mt.gpu_yield(5.0) and pauses == [2.0], "at most 2 s"
+    finally:
+        marker.free()
+    assert not mt.live_running() and not mt.gpu_yield(1.0)
+
+
+def test_low_memory_mac_translates_live_with_nllb(monkeypatch, tmp_path):
+    """T11. On an 8 GB Mac with Hy-MT3 chosen the live translation is NLLB's (a 7B model beside the speech model would
+    swap): Hy-MT3 is never loaded live, @@STAT model says nllb, and the final pass translates those lines again with
+    Hy-MT3 (tr_by is NLLB, not Hy-MT3)."""
+    monkeypatch.setattr(mt, "total_memory", lambda: 8 * 2**30)
+    abort, seen = _live_hy(monkeypatch, tmp_path)
+    translator = FakeTranslator()
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: (translator, FakeTokenizer()))
+    worker, track, events = _live_worker(monkeypatch, tmp_path, TwoLineEngine(), ["English"])
+    worker.start()
+    try:
+        track.feed(_chunk_of_speech(0))
+        assert _wait_for(lambda: any("tr" in l for _, l in events.lines()), 5)
+    finally:
+        worker.stop(wait=10)
+    assert seen["load_lazy"] == [] and seen["requests"] == 0, "Hy-MT3 was not loaded live"
+    assert any(s.get("state") == "nllb" for _, _, s in events.stats("model"))
+    lines = [l for l in track.shown if "text" in l]
+    assert lines and all(l["tr_by"] == {"English": mt.NLLB} and l["tr"]["English"].startswith("T") for l in lines)
+    assert mt.translated_live(lines, "English", True) == {}, "the final pass makes them again with Hy-MT3"
+
+
+def test_live_pos_reports_the_decoded_end(monkeypatch, tmp_path, capsys):
+    """T14. Live: x of y counts decoded audio: with two chunks cut and one decoded, POS is the first chunk's end, not
+    the end of what was cut."""
+    import numpy as np
+    _content_vad(monkeypatch)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    track = mt.LiveTrack("x.wav", tmp_path, "", tmp_path / "x.wav", ["ru"], "normal", None, mt.engine_name())
+    track.feed(np.concatenate([_chunk_of_speech(0), _chunk_of_speech(8)]))
+    assert track.cut() == 2 and track.covered == 16000 * 14
+    track.decode(TwoLineEngine())
+    track.close()
+    assert "@@POS\t6.0\t16.0" in capsys.readouterr().out.splitlines()
+
+
+def test_chunk_stat_carries_whisper_signals_without_changing_lines(monkeypatch, tmp_path, capsys):
+    """T15. decode_chunk gathers the chunk's mean log-probability, highest temperature and compression ratio for
+    @@STAT chunk; the lines are the ones it gives without stats."""
+    class Signals(TwoLineEngine):
+        def decode(self, state, language):
+            segs = super().decode(state, language)
+            segs[0].update(temp=0.4, cr=2.1)
+            segs[1].update(temp=0.0, cr=1.3)
+            return segs
+    chunk = _chunk_of_speech(0).reshape(-1).astype("float32") / 32768
+    plain = mt.decode_chunk(Signals(), chunk, 0, ["ru"], "ru", None)
+    stats = {}
+    assert mt.decode_chunk(Signals(), chunk, 0, ["ru"], "ru", None, stats=stats) == plain
+    assert stats == {"lp": pytest.approx(-0.2), "temp": 0.4, "cr": 2.1}
+    assert not any(k.startswith("_") for l in plain for k in l)
+    _content_vad(monkeypatch)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    track = mt.LiveTrack("x.wav", tmp_path, "", tmp_path / "x.wav", ["ru"], "normal", None, mt.engine_name())
+    track.feed(_chunk_of_speech(0))
+    track.cut()
+    track.decode(Signals())
+    track.close()
+    chunk_stat = [json.loads(o.split("\t")[2]) for o in capsys.readouterr().out.splitlines() if o.startswith("@@STAT\tchunk\t")]
+    assert chunk_stat and chunk_stat[0]["lp"] == -0.2 and chunk_stat[0]["temp"] == 0.4 and chunk_stat[0]["cr"] == 2.1
+    assert chunk_stat[0]["src"] == "live" and chunk_stat[0]["lines"] == 2 and chunk_stat[0]["b"] == 6.0
+
+
+def test_claude_and_cpu_nllb_jobs_run_beside_the_decode(monkeypatch, tmp_path):
+    """T16. A Claude request that takes 3 s runs on the helper thread: the next chunk is decoded and shown meanwhile.
+    Likewise NLLB beside the GPU engine (it runs on the CPU)."""
+    release = threading.Event()
+
+    class SlowClaude(FakeAnthropic):
+        def create(self, **kw):
+            release.wait(3)
+            return super().create(**kw)
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=SlowClaude))
+
+    class SlowNLLB(FakeTranslator):
+        def translate_batch(self, tokens, target_prefix, **kw):
+            release.wait(3)
+            return super().translate_batch(tokens, target_prefix, **kw)
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: (SlowNLLB(), FakeTokenizer()))
+    for offline, engine in ((False, TwoLineEngine()), (True, TwoLineEngine())):
+        if offline:
+            engine.name, engine.mx = "mlx", SimpleNamespace()               # NLLB beside the GPU engine: the helper thread
+        release.clear()
+        worker, track, events = _live_worker(monkeypatch, tmp_path / str(offline), engine, ["English"])
+        worker.offline = worker.translator.offline = offline
+        if not offline:
+            worker.translator.ready, worker.translator.state = True, "ready"
+            worker.translator.models_here.set()
+            worker.translator.prepared.set()
+        worker.start()
+        try:
+            track.feed(_chunk_of_speech(0))
+            assert _wait_for(lambda: worker.translator.current is not None and worker.translator.current.future is not None, 5)
+            track.feed(_chunk_of_speech(8))
+            assert _wait_for(lambda: any(l.get("text") == "c8 one" for _, l in events.lines()), 2.5), "decoded beside the request"
+            assert not any("tr" in l for _, l in events.lines()), "while the first chunk's request is still running"
+            release.set()
+            assert _wait_for(lambda: any("tr" in l for _, l in events.lines()), 5)
+        finally:
+            release.set()
+            worker.stop(wait=10)

@@ -374,7 +374,10 @@ struct JobSettings: Equatable {
     /// `home` is where transcripts are stored (MT_HOME); `apiKey` is passed only when translating; MT_OUT is the output
     /// folder, in which mt.py makes one subfolder per meeting hour.
     func environment(home: String, apiKey: String?, hfToken: String? = nil) -> [String: String] {
-        var env = ["MT_EVENTS": "1", "MT_HOME": home, "MT_OUT": resolvedOutputDir, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"]
+        // No tqdm bars from Hugging Face downloads: each "\r" redraw was a publish of the window; the progress comes as
+        // @@STAT model events instead.
+        var env = ["MT_EVENTS": "1", "MT_HOME": home, "MT_OUT": resolvedOutputDir, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
+                   "HF_HUB_DISABLE_PROGRESS_BARS": "1"]
         if needsAPIKey, let key = apiKey, !key.isEmpty { env["ANTHROPIC_API_KEY"] = key }
         if speakers && pyannote, let token = hfToken, !token.isEmpty { env["HF_TOKEN"] = token }
         return env

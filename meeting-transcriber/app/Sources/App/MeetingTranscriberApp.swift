@@ -5,6 +5,7 @@ import AppKit
 struct MeetingTranscriberApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var runner = Runner.shared
+    @StateObject private var layout = LayoutPrefs.shared        // the View menu's two columns
 
     init() {
         // Command-line entry points for the build's smoke test.
@@ -47,9 +48,18 @@ struct MeetingTranscriberApp: App {
             ContentView()
                 .environmentObject(runner)
         }
+        .defaultSize(width: 1280, height: 860)               // three columns: Controls, Session, Telemetry (min 980 × 660)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            // View ▸ Show Telemetry (⌥⌘T) and Show Settings (⌥⌘S). They take the place of the toolbar's own items, whose
+            // "Hide Toolbar" has ⌥⌘T too: two menu items with one shortcut would leave it to AppKit which one runs.
+            CommandGroup(replacing: .toolbar) {
+                Toggle("Show Telemetry", isOn: Binding(get: { layout.showTelemetry }, set: { layout.showTelemetry = $0 }))
+                    .keyboardShortcut("t", modifiers: [.option, .command])
+                Toggle("Show Settings", isOn: Binding(get: { layout.showControls }, set: { layout.showControls = $0 }))
+                    .keyboardShortcut("s", modifiers: [.option, .command])
+            }
             CommandGroup(after: .appInfo) {
                 Button("Project Page…") {
                     if let url = URL(string: AppInfo.projectURL) { NSWorkspace.shared.open(url) }

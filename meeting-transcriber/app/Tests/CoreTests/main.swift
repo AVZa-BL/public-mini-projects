@@ -763,5 +763,409 @@ do {
     expect((try? DataFolder.make(in: notAFolder, name: "call", date: date)) == nil, "data folder: a data folder that is a file is an error, not a loop")
 }
 
+// MARK: Telemetry
+// @@STAT<TAB>kind<TAB>json (spec B2), the stores it fills, the transcript's caches and ids, the coalescer and the routing.
+do {
+    let tab = "\t"
+    func stat(_ kind: String, _ json: String) -> MTEvent { return EventParser.parse("@@STAT\(tab)\(kind)\(tab)\(json)") }
+    func line(_ t: Double, _ text: String, speaker: String? = nil, live: Bool = false, lang: String = "en",
+              note: String? = nil, tr: [String: String] = [:]) -> TranscriptLine {
+        return TranscriptLine(t: t, end: nil, lang: lang, conf: 1, guess: false, speaker: speaker, text: text, note: note, live: live, tr: tr)
+    }
+
+    let chunkJSON = #"{"src": "live", "track": 1, "i": 7, "a": 120.5, "b": 131.2, "dec_ms": 1840, "rtf": 5.8, "lines": 3, "made_up": 1, "pending": 2, "fed_s": 140.0, "lag_s": 8.8, "lang": "ru", "lp": -0.31, "temp": 0.2, "cr": 1.7}"#
+    expect(stat("chunk", chunkJSON) == .stat(.chunk(ChunkStat(src: "live", track: 1, i: 7, a: 120.5, b: 131.2, decMs: 1840, rtf: 5.8, lines: 3,
+                                                               madeUp: 1, pending: 2, fedS: 140, lagS: 8.8, lang: "ru", lp: -0.31, temp: 0.2, cr: 1.7))),
+           "STAT chunk parses every field")
+
+    let trE = stat("tr", #"{"src": "live", "track": 0, "t": 61.0, "target": "English", "model": "hy", "lines": 1, "ms": 930, "wait_ms": 120, "prefill_ms": 210, "in_tok": 48, "out_tok": 21, "tps": 29.6, "finish": "stop", "lag_s": 4.1, "queue": 2}"#)
+    let skipE = stat("trskip", #"{"reason": "behind", "lines": 7, "targets": ["English", "German"], "total": 19}"#)
+    let queueE = stat("queue", #"{"state": "behind", "jobs": 3, "oldest_s": 41.5, "duty": 0.62, "translated": 88, "skipped": 19, "pending": [0, 1], "behind_s": [0, 12.5]}"#)
+    let modelE = stat("model", #"{"role": "translator", "name": "netprojects/Hy-MT3-7B-MLX-4bit", "engine": "mlx", "state": "downloading", "progress": 0.41, "done_bytes": 1849000000, "total_bytes": 4509715660, "load_ms": 6200, "bytes": 4509715660, "error": "x"}"#)
+    let sysE = stat("sys", #"{"cpu_user_s": 812.4, "cpu_sys_s": 40.2, "rss_max_mb": 7100, "threads": 23, "mlx_active_mb": 6246, "mlx_cache_mb": 512, "mlx_peak_mb": 7000, "mlx_limit_mb": 17000, "gpu_mem_mb": 24576, "gpu_rec_mb": 17800, "disk_free_mb": 120000, "cut_ms": 12.5, "duty_speech": 0.35, "duty_tr": 0.4, "audio_overflows": 0, "yield": true}"#)
+    expect(trE == .stat(.translation(TranslationStat(src: "live", track: 0, t: 61, target: "English", model: "hy", lines: 1, ms: 930, waitMs: 120,
+                                                     prefillMs: 210, inTok: 48, outTok: 21, tps: 29.6, finish: "stop", lagS: 4.1, queue: 2)))
+           && skipE == .stat(.skip(SkipStat(reason: "behind", lines: 7, targets: ["English", "German"], total: 19)))
+           && queueE == .stat(.queue(QueueStat(state: .behind, jobs: 3, oldestS: 41.5, duty: 0.62, translated: 88, skipped: 19,
+                                               pending: [0, 1], behindS: [0, 12.5])))
+           && modelE == .stat(.model(ModelStat(role: "translator", name: "netprojects/Hy-MT3-7B-MLX-4bit", engine: "mlx", state: .downloading,
+                                               progress: 0.41, doneBytes: 1_849_000_000, totalBytes: 4_509_715_660, loadMs: 6200,
+                                               bytes: 4_509_715_660, error: "x")))
+           && sysE == .stat(.sys(SysStat(cpuUserS: 812.4, cpuSysS: 40.2, rssMaxMB: 7100, threads: 23, mlxActiveMB: 6246, mlxCacheMB: 512,
+                                         mlxPeakMB: 7000, mlxLimitMB: 17000, gpuMemMB: 24576, gpuRecMB: 17800, diskFreeMB: 120000, cutMs: 12.5,
+                                         dutySpeech: 0.35, dutyTr: 0.4, audioOverflows: 0, yielding: true))),
+           "STAT tr, trskip, queue, model, sys parse; snake_case to camelCase")
+
+    var unknownState = RunState(kind: .record)
+    let unknownKind = stat("gpu_watts", #"{"w": 3}"#)
+    unknownState.apply(unknownKind)
+    expect(unknownKind == .stat(.ignored) && unknownState.log.isEmpty && unknownState.notes.isEmpty && unknownState.revision == 0,
+           "STAT with an unknown kind is ignored, not logged")
+    expect(stat("chunk", "{bad json") == .stat(.ignored) && stat("chunk", "[1, 2]") == .stat(.ignored) && stat("chunk", "") == .stat(.ignored)
+           && EventParser.parse("@@STAT") == .stat(.ignored), "STAT with broken JSON is ignored")
+    expect(stat("chunk", #"{"src": "final", "b": 30, "rtf": "fast", "lag_s": null, "new_field": {"x": 1}}"#)
+           == .stat(.chunk(ChunkStat(src: "final", b: 30))) && stat("queue", "{}") == .stat(.queue(QueueStat()))
+           && stat("model", #"{"state": "warming"}"#) == .stat(.model(ModelStat(state: .unknown))),
+           "STAT with extra and missing fields parses")
+    let padding = String(repeating: "x", count: 4100)
+    expect(stat("model", "{\"role\": \"speech\", \"error\": \"\(padding)\"}") == .stat(.ignored)
+           && Stat.parse(kind: "chunk", json: "{}", byteCount: Stat.maxBytes + 1) == .ignored
+           && Stat.parse(kind: "chunk", json: "{}", byteCount: Stat.maxBytes) == .chunk(ChunkStat()),
+           "STAT over 4096 bytes is ignored")
+
+    let trLine = TranscriptLine.parse(json: #"{"t": 4.0, "lang": "ru", "conf": 1, "text": "Да", "live": true, "tr": {"English": "Yes"}, "tr_of": "Да", "tr_ms": {"English": 912}, "tr_skip": ["German"], "tr_by": {"English": "hy"}}"#)
+    expect(trLine?.trMs == ["English": 912] && trLine?.trSkipped == ["German"] && trLine?.trBy == ["English": "hy"] && trLine?.tr == ["English": "Yes"],
+           "LINE parses tr_ms, tr_skip, tr_by")
+    let otherText = TranscriptLine.parse(json: #"{"t": 4.0, "lang": "ru", "conf": 1, "text": "Да", "tr": {"English": "Yes, fine"}, "tr_of": "Да, ладно", "tr_ms": {"English": 912}, "tr_by": {"English": "hy"}}"#)
+    expect(otherText?.tr.isEmpty == true && otherText?.trMs.isEmpty == true && otherText?.trBy.isEmpty == true,
+           "LINE: the times and models of translations of another text are dropped with them")
+    var withID = line(1, "a"); withID.id = 7
+    expect(withID == line(1, "a") && withID != line(1, "b"), "TranscriptLine == ignores id")
+
+    var ring = RingBuffer<Int>(capacity: 3)
+    expect(ring.isEmpty && ring.last == nil && ring.elements.isEmpty, "RingBuffer starts empty")
+    for k in 1...5 { ring.append(k) }
+    expect(ring.elements == [3, 4, 5] && Array(ring) == [3, 4, 5] && ring.last == 5 && ring.newest(where: { $0 < 5 }) == 4,
+           "RingBuffer keeps the newest N, oldest first")
+    var big = RingBuffer<Int>(capacity: 100)
+    var maxCount = 0
+    for k in 0..<1000 { big.append(k); maxCount = max(maxCount, big.count) }
+    var sameContent = RingBuffer<Int>(capacity: 100)
+    for k in 900..<1000 { sameContent.append(k) }
+    expect(maxCount == 100 && big.count == 100 && big.capacity == 100 && big.elements.first == 900 && big == sameContent,
+           "RingBuffer never grows past its capacity")
+
+    var lag = TelemetryModel()
+    expect(lag.transcriptLag == nil && lag.translationLag == nil && !lag.hasEngineTelemetry, "no telemetry, no lag")
+    lag.ingest(.chunk(ChunkStat(src: "live", track: 0, b: 30, fedS: 33, lagS: 3)), at: 10)
+    let lag1 = lag.transcriptLag
+    lag.ingest(.queue(QueueStat(state: .ready, pending: [0, 2], behindS: [0, 12.5])), at: 11)
+    let lag2 = lag.transcriptLag
+    lag.ingest(.queue(QueueStat(state: .ready, pending: [0, 0], behindS: [0, 0])), at: 12)
+    lag.ingest(.chunk(ChunkStat(src: "final", track: 0, b: 40)), at: 13)       // no lag_s: the live one still counts
+    expect(lag1 == 3 && lag2 == 12.5 && lag.transcriptLag == 3, "transcript lag: the latest chunk, or a pending chunk's age when larger")
+    lag.ingest(.translation(TranslationStat(target: "English", ms: 900, lagS: 8)), at: 14)
+    let tl1 = lag.translationLag
+    lag.ingest(.queue(QueueStat(state: .behind, jobs: 4, oldestS: 20)), at: 15)
+    let tl2 = lag.translationLag
+    lag.ingest(.queue(QueueStat(state: .ready, jobs: 0, oldestS: nil)), at: 16)
+    expect(tl1 == 8 && tl2 == 20 && lag.translationLag == 8, "translation lag: the latest tr, or the oldest job when larger")
+    expect(LagLevel.transcript(9.9) == .ok && LagLevel.transcript(10) == .slow && LagLevel.transcript(29.9) == .slow
+           && LagLevel.transcript(30) == .behind && LagLevel.translation(14.9) == .ok && LagLevel.translation(15) == .slow
+           && LagLevel.translation(44.9) == .slow && LagLevel.translation(45) == .behind, "LagLevel thresholds 10/30 and 15/45")
+
+    var q = TelemetryModel()
+    q.ingest(.queue(QueueStat(state: .ready, duty: 0.2, skipped: 1)), at: 1)
+    q.ingest(.skip(SkipStat(reason: "behind", lines: 7, targets: ["English"], total: 8)), at: 2)
+    let skippedAfterSkip = q.skippedTotal
+    q.ingest(.queue(QueueStat(state: .behind, duty: 0.81, skipped: 9)), at: 3)
+    expect(q.duty == 0.81 && q.skippedTotal == 9 && skippedAfterSkip == 8 && q.translatorState == .behind,
+           "duty, skipped and state come from the latest queue sample")
+    q.ingest(.model(ModelStat(role: "translator", name: "netprojects/Hy-MT3-7B-MLX-4bit", state: .loading)), at: 4)
+    q.ingest(.model(ModelStat(role: "translator", name: "netprojects/Hy-MT3-7B-MLX-4bit", state: .loading, progress: 0.5)), at: 4.5)
+    q.ingest(.model(ModelStat(role: "translator", name: "netprojects/Hy-MT3-7B-MLX-4bit", state: .ready, loadMs: 6200)), at: 5)
+    expect(q.milestones.map { $0.value } == ["7 lines left for the end (the translation was behind)", "Translation behind: newest lines first",
+                                              "Loading Hy-MT3-7B-MLX-4bit", "Hy-MT3-7B-MLX-4bit loaded in 6.2 s"]
+           && q.models["translator"]?.loadMs == 6200, "milestones: plain words, once per change")
+    var states = TelemetryModel()
+    states.ingest(.model(ModelStat(role: "translator", state: .waiting)), at: 0)
+    expect(states.translatorState == .waiting && TelemetryModel().translatorState == .unknown, "the translator's state without queue samples")
+    let hoverPoints = [ChartPoint(x: 1, y: 10, series: "English"), ChartPoint(x: 5, y: 12, series: "German"),
+                       ChartPoint(x: 4, y: 11, series: "English"), ChartPoint(x: 9, y: 13, series: "German")]
+    expect(ChartPoint.nearest(hoverPoints, to: 4.4) == [hoverPoints[2], hoverPoints[1]]
+           && ChartPoint.nearest(hoverPoints, to: nil).isEmpty && ChartPoint.nearest([], to: 3).isEmpty,
+           "the hover readout: each series' nearest point, in the series' order")
+    var newer = TelemetryModel()
+    newer.ingest(.queue(QueueStat(state: .ready)), at: 1)
+    newer.ingest(.model(ModelStat(role: "translator", state: .behind)), at: 1.2)       // its queue sample was rate-limited
+    let behindNewer = newer.translatorState
+    newer.ingest(.queue(QueueStat(state: .behind)), at: 2)
+    newer.ingest(.model(ModelStat(role: "translator", state: .failed)), at: 3)
+    let failed = newer.translatorState
+    newer.ingest(.queue(QueueStat(state: .loading)), at: 3.1)                          // a late sample of another thread
+    expect(behindNewer == .behind && failed == .failed && newer.translatorState == .failed,
+           "the translator's state: the newer of the queue's and the model's; failed, stopped and nllb win")
+    var stopped = TelemetryModel()
+    stopped.ingest(.queue(QueueStat(state: .behind)), at: 1)
+    stopped.ingest(.model(ModelStat(role: "translator", state: .stopped)), at: 1.1)
+    stopped.ingest(.queue(QueueStat(state: .ready)), at: 1.2)
+    expect(stopped.translatorState == .stopped, "a stopped translator stays stopped")
+
+    var made = TelemetryModel()
+    made.ingest(.chunk(ChunkStat(src: "live", track: 0, a: 0, b: 6, madeUp: 2, fedS: 10)), at: 1)
+    made.ingest(.chunk(ChunkStat(src: "live", track: 1, a: 2, b: 4, madeUp: 1, fedS: 10)), at: 2)
+    made.ingest(.chunk(ChunkStat(src: "live", track: 0, a: 6, b: 8, decMs: 500, fedS: 20)), at: 3)
+    expect(made.madeUpTotal == 3 && abs((made.speechShare ?? 0) - 10.0 / 30) < 1e-9 && made.medianDecodeMs == 0, "made-up count and speech share (Σ(b − a) / fed, all tracks)")
+
+    var ser = TelemetryModel()
+    for k in 0..<1000 {
+        // A spike and a dip, both inside the 600 samples the ring keeps.
+        let mb = k == 800 ? 10240 : k == 450 ? 0 : 1024 + (k % 7) * 10
+        ser.ingest(.sys(SysStat(mlxActiveMB: mb)), at: Double(k))
+        ser.ingest(AppSample(at: Double(k), appCPU: Double(k % 50), childCPU: k == 700 ? 95 : 10))
+    }
+    let whole = ser.series(.mlxActive, window: nil, now: 999)
+    let lastMinute = ser.series(.mlxActive, window: 60, now: 999)
+    let cpu = ser.series(.childCPU, window: nil, now: 999, maxPoints: 50)
+    expect(ser.sys.count == 600 && whole.count <= 300 && whole.contains { $0.y == 0 } && whole.contains { $0.y == 10 }
+           && whole.map { $0.x } == whole.map { $0.x }.sorted() && whole.allSatisfy { $0.series == "MLX active" }
+           && lastMinute.count == 61 && lastMinute.allSatisfy { $0.x >= 939 }
+           && cpu.count <= 50 && cpu.contains { $0.y == 95 } && cpu.first?.series == "mt.py",
+           "series keeps the window, at most 300 points, min and max kept")
+    var lagSeries = TelemetryModel()
+    lagSeries.ingest(.chunk(ChunkStat(src: "live", lagS: 2)), at: 1)
+    lagSeries.ingest(.queue(QueueStat(pending: [3, 0], behindS: [9, 0])), at: 2)
+    lagSeries.ingest(.queue(QueueStat(pending: [0, 1], behindS: [0, 0])), at: 3)
+    lagSeries.ingest(.translation(TranslationStat(target: "German", ms: 1500, tps: 22)), at: 3.5)
+    expect(lagSeries.series(.transcriptLag, window: nil, now: 3).map { $0.y } == [2, 9, 2]
+           && lagSeries.series(.pending(track: 1), window: nil, now: 3) == [ChartPoint(x: 2, y: 0, series: "Track 2"), ChartPoint(x: 3, y: 1, series: "Track 2")]
+           && lagSeries.series(.trSeconds, window: nil, now: 4) == [ChartPoint(x: 3.5, y: 1.5, series: "German")]
+           && lagSeries.series(.pending(track: 5), window: nil, now: 3).isEmpty,
+           "series: the lag as the hero number stood at each sample; pending per track; seconds per job by target")
+
+    var co = EventCoalescer()
+    let evs: [MTEvent] = (0..<5).map { .eta($0) }
+    var out: [[MTEvent]] = []
+    var outAt: [Double] = []
+    let times = [0.0, 0.02, 0.05, 0.11, 0.12]
+    var dueAt005: Double? = nil
+    for (k, at) in times.enumerated() {
+        if let batch = co.add([evs[k]], now: at) { out.append(batch); outAt.append(at) }
+        if at == 0.05 { dueAt005 = co.nextDue(now: at) }
+    }
+    let heldBeforeDrain = co.nextDue(now: 0.13)
+    out.append(co.drain())
+    let gaps = zip(outAt.dropFirst(), outAt).map { $0 - $1 }
+    expect(out == [[evs[0]], [evs[1], evs[2], evs[3]], [evs[4]]] && out.flatMap { $0 } == evs && gaps.allSatisfy { $0 >= 0.1 }
+           && abs((dueAt005 ?? -1) - 0.05) < 1e-9 && heldBeforeDrain != nil && co.nextDue(now: 1) == nil && co.drain().isEmpty
+           && co.add([], now: 5) == nil,
+           "EventCoalescer: at most one batch per 100 ms, nothing lost, order kept, drain at the end")
+    var trailing = EventCoalescer()
+    _ = trailing.add([.eta(1)], now: 10)
+    let heldOne = trailing.add([.eta(2)], now: 10.03)
+    expect(heldOne == nil && trailing.add([], now: 10.1) == [.eta(2)], "EventCoalescer: the trailing flush hands out what was held")
+
+    let routed = EventRouting.split([.line(line(1, "a")), .stat(.sys(SysStat(threads: 3))), .level(0.2), .position(done: 1, total: 2),
+                                     .stat(.ignored), .level(0.7), .stat(.queue(QueueStat(jobs: 1)))])
+    var routedState = RunState(kind: .record)
+    for e in routed.state { routedState.apply(e) }
+    expect(routed.state == [.line(line(1, "a")), .position(done: 1, total: 2)] && routed.stats == [.sys(SysStat(threads: 3)), .queue(QueueStat(jobs: 1))]
+           && routed.level == 0.7 && routedState.level == 0 && EventRouting.split([.eta(3)]).level == nil,
+           "EventRouting: STAT and LEVEL never reach RunState; the last level wins")
+
+    var rev = RunState(kind: .record)
+    rev.apply(.position(done: 3, total: 10)); rev.apply(.note("x")); rev.apply(.level(0.4)); rev.apply(.eta(30))
+    rev.apply(.stat(.sys(SysStat()))); rev.apply(.text("warning")); rev.apply(.clear)
+    let revQuiet = rev.revision
+    rev.apply(.line(line(1, "a", live: true)))
+    let revOne = rev.revision
+    rev.apply(.line(line(1, "a", live: true)))                     // sent again unchanged
+    let revSame = rev.revision
+    rev.apply(.line(line(1, "a", live: true, tr: ["English": "A"])))
+    let revTr = rev.revision
+    rev.apply(.clear); let revClear = rev.revision
+    rev.apply(.clear)
+    expect(revQuiet == 0 && revOne == 1 && revSame == 1 && revTr == 2 && revClear == 3 && rev.revision == 3,
+           "RunState revision changes only with lines (not POS, NOTE, LEVEL)")
+
+    var ids = RunState(kind: .record)
+    ids.apply(.line(line(1, "a", speaker: "You", live: true)))
+    ids.apply(.line(line(2, "b", speaker: "Them", live: true)))
+    ids.apply(.line(line(3, "c", speaker: nil, live: true)))
+    let firstIDs = ids.lines.map { $0.id }
+    ids.apply(.line(line(2, "b", speaker: "Them", live: true, tr: ["English": "B"])))
+    ids.apply(.line(line(3, "C", speaker: "Speaker 1", live: false)))
+    let keptIDs = ids.lines.map { $0.id }
+    ids.apply(.clear)
+    ids.apply(.line(line(9, "z")))
+    var seeded = RunState(kind: .transcribe)
+    seeded.lines = ids.lines + [line(10, "y")]                      // an id of 0: the set renumbers
+    seeded.apply(.line(line(11, "x")))
+    expect(firstIDs == [1, 2, 3] && keptIDs == [1, 2, 3] && ids.lines.map { $0.id } == [1]
+           && seeded.lines.map { $0.id } == [1, 2, 3] && seeded.spokenLines == 3,
+           "line ids stay through merge and translation; restart after CLEAR")
+
+    // The 1.12.0 definitions, copied: the caches must give the same.
+    func refMerge(_ lines: inout [TranscriptLine], _ line: TranscriptLine) {
+        if let i = lines.lastIndex(where: { $0.t == line.t && $0.isNote == line.isNote
+                                            && ($0.speaker == line.speaker || ($0.live && !line.live && ($0.speaker == nil || line.speaker == nil))) }) {
+            var merged = line
+            if merged.tr.isEmpty && merged.text == lines[i].text { merged.tr = lines[i].tr }
+            lines[i] = merged
+        } else {
+            lines.append(line)
+        }
+    }
+    func refShares(_ lines: [TranscriptLine]) -> [String] {
+        var counts: [String: Int] = [:]
+        for line in lines where !line.isNote { counts[line.lang, default: 0] += 1 }
+        let total = counts.values.reduce(0, +)
+        guard total > 0 else { return [] }
+        return counts.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .map { "\($0.key) \(Int((Double($0.value) * 100 / Double(total)).rounded()))" }
+    }
+    func refChoices(_ lines: [TranscriptLine], _ targets: [String]) -> [String] {
+        var seen: [String] = []
+        for name in lines.flatMap({ $0.tr.keys.sorted() }) + targets where !seen.contains(name) { seen.append(name) }
+        return seen
+    }
+    func refLabels(_ lines: [TranscriptLine]) -> [String] {
+        var seen: [String] = []
+        for line in lines {
+            if let s = line.speaker, s.range(of: #"^\S.* \d+$"#, options: .regularExpression) != nil, !seen.contains(s) { seen.append(s) }
+        }
+        return seen
+    }
+    struct SplitMix { var state: UInt64
+        mutating func next() -> UInt64 { state &+= 0x9E3779B97F4A7C15; var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9; z = (z ^ (z >> 27)) &* 0x94D049BB133111EB; return z ^ (z >> 31) }
+        mutating func below(_ n: Int) -> Int { return Int(next() % UInt64(n)) } }
+    var rng = SplitMix(state: 20261128)
+    var cached = RunState(kind: .record)
+    cached.targets = ["German", "Spanish"]
+    var reference: [TranscriptLine] = []
+    var mismatches = 0
+    var idProblems = 0
+    let speakers: [String?] = [nil, "You", "Them", "Speaker 1", "Speaker 2", "Them 3", " 4"]
+    let languages = ["en", "ru", "de"], texts = ["a", "b", "c"], keys = ["English", "French", "German"]
+    for step in 0..<2000 {
+        let roll = rng.below(100)
+        let event: MTEvent
+        if roll < 75 {
+            var tr: [String: String] = [:]
+            for key in keys where rng.below(3) == 0 { tr[key] = "x" }
+            let isNote = rng.below(15) == 0
+            event = .line(line(Double(rng.below(60)), texts[rng.below(texts.count)], speaker: speakers[rng.below(speakers.count)],
+                               live: rng.below(2) == 0, lang: languages[rng.below(languages.count)], note: isNote ? "n" : nil, tr: tr))
+        } else if roll < 76 { event = .clear }
+        else if roll < 77 { event = .file(index: 1, count: rng.below(2) + 1, path: "f") }
+        else if roll < 85 { event = .position(done: Double(step), total: 3000) }
+        else if roll < 92 { event = .level(0.3) }
+        else if roll < 96 { event = .stat(.queue(QueueStat(jobs: step))) }
+        else { event = .note("n") }
+        let before = cached.lines
+        cached.apply(event)
+        switch event {
+        case .line(let l): refMerge(&reference, l)
+        case .clear: reference = []
+        case .file(_, let count, _): if count > 1 { reference = [] }
+        default: break
+        }
+        if step == 1000 { cached.lines = cached.lines; }            // a set: the caches are rebuilt, the ids kept
+        let lines = cached.lines
+        if lines != reference || cached.spokenLines != reference.filter({ !$0.isNote }).count
+            || cached.languageShares.map({ "\($0.0) \($0.1)" }) != refShares(reference)
+            || cached.translationChoices != refChoices(reference, cached.targets) || cached.speakerLabelList != refLabels(reference) {
+            mismatches += 1
+        }
+        let idList = lines.map { $0.id }
+        if Set(idList).count != idList.count || idList.contains(0) { idProblems += 1 }
+        // A line that was there before keeps its id (the same place, unless the lines were cleared).
+        if lines.count >= before.count && !before.isEmpty && zip(before, lines).contains(where: { $0.id != $1.id }) { idProblems += 1 }
+    }
+    expect(mismatches == 0 && idProblems == 0 && cached.lines.count > 20,
+           "cached counts equal recomputed ones after 2,000 random events (seeded)")
+
+    // Every merge case of the run-state tests above, through both.
+    let mergeCases: [[TranscriptLine]] = [
+        [line(0, "a", speaker: "You", live: true), line(0, "b", speaker: "Them", live: true), line(0, "A", speaker: "You"), line(0, "A2", speaker: "You")],
+        [line(3, "x", live: true), line(3, "X", speaker: "Speaker 1")],
+        [line(2, "hello", speaker: "You", live: true), line(2, "hello there", speaker: "You"), line(2, "x", speaker: "Boris")],
+        [line(2, "Привет", live: true, tr: ["English": "Hello"]), line(2, "Привет"), line(2, "Привет!"), line(2, "Привет!", tr: ["English": "Hello!"])],
+        [line(0, "a"), line(0, "a", speaker: "You")],
+        [line(7, "", note: "n"), line(7, "t"), line(7, "", note: "m")],
+        [line(1, "a", speaker: nil, live: true), line(1, "b", speaker: nil, live: true), line(1, "c", speaker: "You")],
+    ]
+    var mergeSame = true
+    for steps in mergeCases {
+        var st = RunState(kind: .record)
+        var refLines: [TranscriptLine] = []
+        for l in steps { st.apply(.line(l)); refMerge(&refLines, l) }
+        if st.lines != refLines { mergeSame = false }
+    }
+    expect(mergeSame, "the merge index gives the same lines as lastIndex(where:) on every existing merge case")
+
+    var resend = RunState(kind: .record)
+    var first = line(5, "Да", live: true, tr: ["English": "Yes"])
+    first.trMs = ["English": 900]; first.trSkipped = ["German"]; first.trBy = ["English": "hy"]
+    resend.apply(.line(first))
+    resend.apply(.line(line(5, "Да")))
+    let kept = resend.lines.first
+    var finalTr = line(5, "Да", tr: ["English": "Yes", "German": "Ja"])
+    finalTr.trBy = ["English": "hy", "German": "hy"]
+    resend.apply(.line(finalTr))
+    let afterFinal = resend.lines.first
+    resend.apply(.line(line(5, "Да, да")))
+    expect(kept?.trMs == ["English": 900] && kept?.trSkipped == ["German"] && kept?.trBy == ["English": "hy"] && kept?.tr == ["English": "Yes"]
+           && afterFinal?.trSkipped.isEmpty == true && afterFinal?.trMs == ["English": 900]
+           && resend.lines.first?.trMs.isEmpty == true && resend.lines.first?.trSkipped.isEmpty == true,
+           "tr_skip and tr_ms survive a resend without them, for the same text")
+
+    var twoTargets = RunState(kind: .record)
+    var english = line(6, "Да", live: true, tr: ["English": "Yes"])
+    english.trMs = ["English": 199]; english.trBy = ["English": "hy"]
+    twoTargets.apply(.line(english))
+    var german = line(6, "Да", live: true, tr: ["English": "Yes", "German": "Ja"])
+    german.trMs = ["German": 210]; german.trBy = ["English": "hy", "German": "hy"]
+    twoTargets.apply(.line(german))
+    let both = twoTargets.lines.first
+    var skipFrench = line(6, "Да", live: true); skipFrench.trSkipped = ["French"]
+    twoTargets.apply(.line(skipFrench))
+    var skipSpanish = line(6, "Да", live: true); skipSpanish.trSkipped = ["Spanish"]
+    twoTargets.apply(.line(skipSpanish))
+    let skips = twoTargets.lines.first
+    expect(both?.trMs == ["English": 199, "German": 210] && both?.tr == ["English": "Yes", "German": "Ja"]
+           && skips?.trSkipped == ["French", "Spanish"] && skips?.trMs == ["English": 199, "German": 210]
+           && twoTargets.lines.count == 1,
+           "a resend with tr_ms (tr_skip) of another target keeps the earlier target's, for the same text")
+
+    expect(CPUUsage.percent(prevNanos: 1_000_000_000, nanos: 3_000_000_000, wallSeconds: 2, cores: 4) == 25
+           && CPUUsage.percent(prevNanos: 5, nanos: 1, wallSeconds: 2, cores: 4) == 0
+           && CPUUsage.percent(prevNanos: 0, nanos: 1_000_000_000, wallSeconds: 0, cores: 4) == 0
+           && CPUUsage.percent(prevNanos: 0, nanos: 100_000_000_000, wallSeconds: 1, cores: 10) == 100,
+           "CPUUsage.percent from two samples")
+    expect(TranslatorState(wire: "ready") == .ready && TranslatorState(wire: "Behind") == .behind && TranslatorState(wire: "warming") == .unknown
+           && TranslatorState(wire: nil) == .unknown && TranslatorState(wire: "released") == .released,
+           "TranslatorState from a string; an unknown one is .unknown")
+
+    var words = TelemetryModel()
+    let noTelemetry = TelemetrySummary.lag(words)
+    words.ingest(.chunk(ChunkStat(src: "live", lagS: 3)), at: 1)
+    words.ingest(.translation(TranslationStat(target: "English", lagS: 8)), at: 2)
+    let steady = TelemetrySummary.lag(words)
+    words.ingest(.translation(TranslationStat(target: "English", lagS: 20)), at: 40)
+    let rising = TelemetrySummary.lag(words)
+    words.ingest(.sys(SysStat(mlxActiveMB: 6246, mlxCacheMB: 512)), at: 41)
+    words.ingest(AppSample(at: 41, appFootprintMB: 310, childFootprintMB: 7373, pressure: 0))
+    expect(noTelemetry == "No telemetry from this engine" && steady == "3 seconds, steady; translation 8 seconds, steady"
+           && rising == "3 seconds, steady; translation 20 seconds, slow, rising"
+           && TelemetrySummary.memory(words) == "MLX 6.1 GB active, 512 MB cache; mt.py 7.2 GB; app 310 MB; pressure normal"
+           && TelemetrySummary.memory(TelemetryModel()) == "No memory figures yet"
+           && TelemetrySummary.pressure(TelemetrySummary.pressureLevel(dispatchRaw: 0x4)) == "critical" && TelemetrySummary.pressure(1) == "warning"
+           && TelemetrySummary.thermal(2) == "Serious" && TelemetrySummary.seconds(1) == "1 second",
+           "TelemetrySummary words")
+    expect(Format.ms(850) == "850 ms" && Format.ms(6200) == "6.2 s" && Format.megabytes(512) == "512 MB" && Format.megabytes(6246) == "6.1 GB"
+           && Format.bytes(4_509_715_660) == "4.2 GB" && Format.bytes(900) == "900 bytes" && Format.percent(0.41) == "41 %"
+           && Format.rate(2.14, unit: "×") == "2.1×" && Format.rate(18.44, unit: "tok/s") == "18.4 tok/s",
+           "telemetry number formats")
+
+    expect(JobSettings().environment(home: "/h", apiKey: nil)["HF_HUB_DISABLE_PROGRESS_BARS"] == "1",
+           "JobSettings.environment disables HF progress bars")
+
+    // Printed, not asserted: applying 10,000 LINE events (a new line, then its translation arriving, as live).
+    var timed = RunState(kind: .record)
+    timed.targets = ["English"]
+    let start = Date()
+    for k in 0..<5000 {
+        let l = line(Double(k) * 4, "line number \(k) of a long meeting", speaker: k % 2 == 0 ? "You" : "Them", live: true, lang: k % 3 == 0 ? "en" : "ru")
+        timed.apply(.line(l))
+        var translatedLine = l; translatedLine.tr = ["English": "translation \(k)"]
+        timed.apply(.line(translatedLine))
+    }
+    let perEvent = Date().timeIntervalSince(start) / 10_000 * 1000
+    print(String(format: "timing: 10,000 LINE events applied, %.4f ms per event (%d lines; the 1.12.0 model layer took 0.47 ms at 10,000 lines)",
+                 perEvent, timed.lines.count))
+}
+
 print("\(passes) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

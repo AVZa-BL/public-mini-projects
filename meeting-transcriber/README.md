@@ -76,6 +76,27 @@ with `mt.py record --no-transcribe --live` and queues `mt.py transcribe audio.wa
 which continues from what was transcribed live. A job that runs beside a recording takes half the cores (`MT_THREADS`), so the live
 transcript keeps up; with both running, two speech models are in memory (about 3.5 GB with `large-v3-turbo`).
 
+**The window and its telemetry** (since 1.13.0). The window has three columns (at least 980 × 660 points, 1280 × 860 at first):
+**Controls** (every setting, as before; *View > Show Settings*, ⌥⌘S, hides it), **Session** (the recording or the job: its
+header, the transcript, the processing strip and a status bar) and **Telemetry** (cards with charts of what `mt.py` reports;
+shown by default; *View > Show Telemetry*, ⌥⌘T, hides it, and the choice is kept). The status bar is always there, for example
+`whisper-large-v3-turbo · Apple GPU (MLX) | Hy-MT3-7B-MLX-4bit ready (load 6.2 s) | lag 3 s · translation 8 s | MLX 6.1 GB ·
+pressure normal | CPU 38 %`; each part opens its card. The transcript's **lag chip** is the number of seconds between the end
+of what was said and its line on screen: green with a tick below 10 s, yellow with a triangle from 10 s, red with a stop sign from 30 s (the translation's lag: 15 s and
+45 s). A translation cell says *at the end* when that line is left to the translation at the end (see *While it works*), and
+*Timings* shows how long each translation took and which model made it. The cards: live health (both lags over time),
+the speech engine (speed per chunk, × real time), the translator (its state: downloading, checking files, waiting for the other
+job, loading, ready, behind; tokens per second; its share of the last minute), the queues, memory (MLX's own figures, the
+footprint of `mt.py` and of the app, memory pressure, swap, audio blocks the recorder dropped), CPU, GPU and heat, languages,
+and the last events in plain words. The GPU's busy share comes from a counter Apple does not document (labelled so). Nothing of
+the telemetry is written into a transcript or a file: `mt.py` sends it, with `MT_EVENTS=1` (which the app sets), as lines
+`@@STAT<tab>kind<tab>{json}` on stdout (kinds `chunk`, `tr`, `trskip`, `queue`, `model`, `sys`: per decoded chunk, per finished
+translation, per skip, every second, per change of a model's state, every 2 s; never per token), and it lives in the window
+only. To see it on the command line, write the events to a file and read it in a second terminal (a `| grep` behind `record`
+would be ended by the Ctrl+C that stops the recording, and `mt.py` would then fail on the closed pipe):
+`MT_EVENTS=1 python3 mt.py record --live --to German --offline --translator hy > events.log 2>&1`, and
+`tail -f events.log | grep --line-buffered -E '^@@(STAT|LINE)'`.
+
 The app is a front end for `mt.py` (bundled inside it), so it produces exactly the files described under *Use*.
 The same `VERSION` file versions the app, the command-line tool and the launcher entry. Bump it when you change either.
 
@@ -567,6 +588,22 @@ every translation file: `# [00:12:03] speech not recognised for 24 s` marks a st
 noisy, or a language it does not know), and a note at the end says how much of the speech found was decoded. A `[de?]` tag marks a
 guess: a language outside your list that Whisper was sure of, or a low confidence.
 
+**The live transcript never waits for the translation** (since 1.13.0). Up to 1.12.0 one thread decoded a stretch and then
+translated its every line into every target before it decoded the next one, and it loaded the translation model at the first
+line: with Hy-MT3 and two targets the transcript froze for the load and then fell further behind the longer the meeting went
+(in the lag driver, at 6 s a line and target, 256 s behind at the median after ten minutes). Now the one thread that uses the GPU
+decodes a closed stretch whenever there is one and translates in between, **one token at a time**, so a line appears at most
+about a second (one look for closed stretches, plus one token) later than it would without translation, however long the
+translation takes. The translation model starts loading when the recording starts, in slices of 256 MB between two stretches;
+its download and the check of its files run beside the work. When the Mac cannot translate as fast as people speak, a line
+whose translation is more than **30 s behind** is not translated live: it is marked *at the end* in the window and translated by
+the final pass with the same model, so the files are the same either way. The live translator also leaves a fifth of each
+minute free (it starts no new line while it worked more than 48 s of the last 60). When the recording stops, the translation
+stops at once (what is left goes to the final pass) and the live transcript is finished for at most 90 s, so the stop never
+waits for a translation; what is not finished then is transcribed by the final pass. *Live: x of y* now counts the audio
+that is **decoded**, not the audio cut into stretches, so it shows the real backlog. The program's own messages about this go
+to the log (*Details*) and the telemetry, never into the transcript's notes.
+
 **What Whisper makes up on noise is left out** (since 1.10.3). Whisper learned from subtitled video, so on silence, music or
 noise it writes the credits of those subtitles: "Субтитры сделал DimaTorzok", "Редактор субтитров А.Синецкая Корректор
 А.Егорова", "Subtitles by the Amara.org community", "Untertitel im Auftrag des ZDF" (openai/whisper discussions 928 and 1873;
@@ -772,6 +809,16 @@ the app it is the *Offline model* for anyone who has not chosen one; a choice ma
   note ("ran to the token limit").
 - **Cost:** about 4.5 GB of memory, about 6 GB beside the speech model while a recording is translated live (estimates from the
   same-size Hy-MT2-7B, 4.53 GB at peak; not measured); the run says so on a Mac with less than 12 GB. Speed not measured on a Mac.
+- **Live, since 1.13.0:** the model is loaded when a recording starts, in steps between two stretches of speech, while the
+  transcript goes on (the window's Translator card shows *Checking files*, *Loading xx %*, *Ready* and the load time). **One
+  7B translator at a time on the Mac:** TranslateGemma and Hy-MT3 take a slot (a lock file in `~/Library/Caches/meeting-transcriber/`)
+  while loaded; when a recording wants to translate live while an earlier job translates with the model, the job lets it go
+  after its current line ("Paused: the recording in progress translates live (one translation model at a time)"), waits, and
+  goes on from where it stopped when the recording ends; a job that finds the slot taken waits ("Waiting for the live
+  translation of the recording in progress"). A job beside a live recording also pauses after each chunk or line as long as it
+  took (at most 2 s), so it uses the GPU at most half the time. On a Mac with less than 12 GB (16 GB for TranslateGemma) the
+  live translation uses NLLB instead and Hy-MT3 translates at the end. In a recording process MLX's buffer cache is capped at
+  1 GB (`MT_MLX_CACHE_MB` changes it).
 - **Licence:** Apache-2.0; Tencent's LICENSE.txt: "does not impose any additional restrictions beyond those specified in the
   license". Commercial use is allowed (NLLB's licence does not allow it).
 - **Downloads, setup, live use:** as TranslateGemma's (below): fetched before a job, beside a recording without waiting, the same
@@ -839,17 +886,25 @@ translates, or `MT_TRANSLATOR=gemma`) uses Google's TranslateGemma 12B instead o
 - A 3-hour recording is ~350 MB of 16 kHz WAV (115 MB per hour per track). Transcribing holds the audio as float32 (about
   230 MB per hour) plus the speech model (about 1.6 GB); the voice-activity detector runs on 10-minute windows, so a 4-hour file
   needs about 1 GB for its audio and no large extra copies. A Mac with 8 GB can do it; close other large programs.
+- **Live translation on a slow Mac:** with several targets and a dense meeting the live translator may not keep up; then many
+  lines are marked *at the end* and translated only by the final pass (the transcript itself stays live). The Translator card
+  shows how many and why (its share of the minute).
+- **GPU busy** in the telemetry is an IORegistry counter that Apple does not document; take it as a hint.
 - Recording people requires their consent in many jurisdictions.
 
 ## Version
 
-`VERSION` holds the version (`python3 mt.py --version`, and the app's version); the launcher, another project of the development repository, shows it with the date of the last change.
+`VERSION` holds the version (`python3 mt.py --version`, and the app's version), now 1.13.0; the launcher, another project of the development repository, shows it with the date of the last change.
 Bump it when you change the tool or the app.
 
 ## Tests
 
 ```bash
 pip install pytest numpy && python3 -m pytest tests                    # mt.py (needs ffmpeg for the audio-format tests)
+# 1.13.0: the live scheduler's tests (T1-T16 of the design) start at "the live transcript never waits for a translation" in
+# tests/test_mt.py: the stall reproduced with real threads (a slow translation, the first model load), the lag on a virtual
+# clock over the lag driver's grid, the stop, the steps' text against 1.12.0's one-shot path, one thread for MLX, the LLM slot
+# and the GPU yield, the low-memory fallback and the @@STAT events; the app's CoreTests have a "Telemetry" section
 # tests/test_windows.py covers the Windows parts (faked where needed) and runs for real on the Windows CI job, where the
 # tests that send POSIX signals skip; on Windows run them with $env:PYTHONUTF8 = "1"
 swiftc -module-name CoreTests app/Sources/Core/*.swift app/Tests/CoreTests/main.swift -o /tmp/mt-core-tests && /tmp/mt-core-tests   # the app's logic

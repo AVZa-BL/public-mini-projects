@@ -1,4 +1,7 @@
 #import <Foundation/Foundation.h>
+// proc_pid_rusage for the telemetry's sampler (SystemSampler.swift): declared in libproc.h, which this bridging header
+// makes visible to Swift whether or not the SDK's Darwin module exports it.
+#include <libproc.h>
 
 NS_ASSUME_NONNULL_BEGIN
 

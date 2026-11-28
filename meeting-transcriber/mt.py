@@ -80,6 +80,29 @@ SILENT_PEAK = 0.002   # a track whose loudest sample stays below this was silent
 REOPEN_S = 5          # seconds between attempts to reopen a microphone that stopped
 NOTICE_S = 600        # a notice this long before a recording stops at its limit
 EXTEND_S = 3600       # what one SIGUSR1 (the app's "Extend") adds to a running recording
+# The live worker's scheduler (LiveWorker.step): speech first, the translation one token (or one load slice, one NLLB
+# batch) at a time between two decodes, so a line is never held up by a translation (1.13.0).
+CUT_EVERY_S = 1.0     # how often the worker looks for chunks to close, as its idle wait did before
+LIVE_TR_BEHIND_S = 30  # a live translation more than this behind the audio: the older chunks are left to the final pass
+LIVE_TR_DUTY = 0.8    # the share of the trailing minute the live translator may spend; above it no new job starts
+LIVE_DRAIN_S = 90     # after the stop, the pending chunks are decoded for at most this long (the app waits 120 s)
+STAT_SYS_EVERY_S = 2.0   # @@STAT sys: the process's CPU and memory, this often
+STAT_QUEUE_EVERY_S = 1.0  # @@STAT queue: the live translator's queue, this often
+LOAD_SLICE_BYTES = 256 << 20   # the live worker evaluates a model's weights in slices of at most this many bytes
+DOWNLOAD_STAGE_EVERY_S = 2.0   # a job's model download: its STAGE again with the GB so far, this often
+
+
+def _cache_mb(value):
+    """MT_MLX_CACHE_MB: a whole number of MB (0: no cache); anything else is 1024, with a warning (not a crash)."""
+    if value is None:
+        return 1024
+    if value.strip().isdigit():
+        return int(value)
+    print(f"MT_MLX_CACHE_MB={value!r} is not a whole number of MB: 1024 is used", file=sys.stderr)
+    return 1024
+
+
+MLX_CACHE_MB = _cache_mb(os.environ.get("MT_MLX_CACHE_MB"))   # the MLX buffer cache of a live process, at most
 
 
 # One event line at a time on stdout: the live worker's thread and the main thread both send events, and print() writes
@@ -110,6 +133,272 @@ def note(text):
         ev("NOTE", text)
     else:
         print(text, file=sys.stderr)
+
+
+# Telemetry: "@@STAT<TAB>kind<TAB>{json}" (chunk, tr, trskip, queue, model, sys), for the app's telemetry column only.
+# Nothing of it goes into a line, the checkpoint, a file or a NOTE. Seconds are rounded to 0.1, fractions to 0.01;
+# strings are cut at 200 characters, and shortened further when a line would be over STAT_LINE_BYTES; a field that is
+# None is left out (the app reads a missing key as unknown).
+STAT_FINE = frozenset(("progress", "duty", "duty_speech", "duty_tr", "lp", "cr"))
+STAT_LINE_BYTES = 1024       # a whole @@STAT line, at most (the app reads up to 4096)
+
+
+def _stat_value(key, value):
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return round(value, 2 if key in STAT_FINE else 1)
+    if isinstance(value, str):
+        return value[:200]
+    if isinstance(value, (list, tuple)):
+        return [_stat_value(key, v) for v in value]
+    return str(value)[:200]
+
+
+def stat(kind, **fields):
+    """One telemetry event, when the app reads events (EVENTS); a few tens of microseconds, never per token."""
+    if not EVENTS:
+        return
+    clean = {k: _stat_value(k, v) for k, v in fields.items() if v is not None}
+    clean = {k: v for k, v in clean.items() if v is not None}
+    room = STAT_LINE_BYTES - len(f"@@STAT\t{kind}\t".encode("utf-8"))
+    body = json.dumps(clean, separators=(",", ":"), ensure_ascii=False)
+    while len(body.encode("utf-8")) > room:            # a long non-ASCII name or error: the longest string or list halved
+        long = [k for k, v in clean.items() if isinstance(v, (str, list)) and v]
+        if not long:
+            break
+        k = max(long, key=lambda k: len(json.dumps(clean[k], ensure_ascii=False).encode("utf-8")))
+        clean[k] = clean[k][:len(clean[k]) // 2]
+        body = json.dumps(clean, separators=(",", ":"), ensure_ascii=False)
+    ev("STAT", kind, body)
+
+
+_DEVICE_INFO = []            # MLX's device_info() once: its memory size and recommended working set do not change
+
+
+def sys_fields():
+    """The process's CPU time, peak memory, threads and, when MLX is loaded, its memory (for @@STAT sys)."""
+    fields = {}
+    try:
+        t = os.times()
+        fields.update(cpu_user_s=t.user, cpu_sys_s=t.system)
+    except Exception:
+        pass
+    try:
+        import resource                                # not on Windows
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        fields["rss_max_mb"] = int(peak) >> 20 if sys.platform == "darwin" else int(peak) >> 10   # bytes on macOS, KiB on Linux
+    except Exception:
+        pass
+    fields["threads"] = threading.active_count()
+    mx = sys.modules.get("mlx.core")                   # never imported for this: only a process that uses MLX reports it
+    if mx is not None:
+        metal = getattr(mx, "metal", None)
+        for name, key in (("get_active_memory", "mlx_active_mb"), ("get_cache_memory", "mlx_cache_mb"),
+                          ("get_peak_memory", "mlx_peak_mb"), ("get_memory_limit", "mlx_limit_mb")):
+            fn = getattr(mx, name, None) or getattr(metal, name, None)
+            try:
+                if callable(fn):
+                    fields[key] = int(fn()) >> 20
+            except Exception:
+                pass
+        if not _DEVICE_INFO:
+            fn = getattr(mx, "device_info", None) or getattr(metal, "device_info", None)
+            try:
+                _DEVICE_INFO.append(dict(fn()) if callable(fn) else {})
+            except Exception:
+                _DEVICE_INFO.append({})
+        info = _DEVICE_INFO[0]
+        for name, key in (("memory_size", "gpu_mem_mb"), ("max_recommended_working_set_size", "gpu_rec_mb")):
+            if isinstance(info.get(name), (int, float)):
+                fields[key] = int(info[name]) >> 20
+    return fields
+
+
+def disk_free_mb():
+    import shutil
+    try:
+        return shutil.disk_usage(DATA if DATA.exists() else DATA.parent).free >> 20
+    except OSError:
+        return None
+
+
+class SysSampler:
+    """@@STAT sys every STAT_SYS_EVERY_S, at a chunk or step boundary on the thread that owns MLX; the free disk every
+    10th sample. `clock` is the caller's (a test's virtual one)."""
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.last, self.n = clock, None, 0
+
+    def due(self):
+        now = self.clock()
+        if self.last is None:
+            self.last = now
+            return False
+        return now - self.last >= STAT_SYS_EVERY_S
+
+    def send(self, **extra):
+        now = self.clock()
+        interval = max(1e-9, now - (self.last if self.last is not None else now))
+        self.last = now
+        self.n += 1
+        fields = sys_fields()
+        if self.n % 10 == 1:
+            fields["disk_free_mb"] = disk_free_mb()
+        for key in ("duty_speech", "duty_tr"):
+            if key in extra and extra[key] is not None:
+                extra[key] = min(1.0, extra[key] / interval)
+        fields.update(extra)
+        stat("sys", **fields)
+
+
+# ---------- one translation model per Mac: the LLM slot, and the live marker ----------
+LOCK_DIR = None              # where the lock files are; None: the user's cache (macOS) or the temp folder (tests set it)
+
+
+def lock_dir():
+    """~/Library/Caches/meeting-transcriber on macOS (the home, not MT_HOME, so the app's jobs and the command line share
+    it), elsewhere <temp>/meeting-transcriber-<uid>."""
+    if LOCK_DIR:
+        d = Path(LOCK_DIR)
+    elif sys.platform == "darwin":
+        d = Path.home() / "Library" / "Caches" / "meeting-transcriber"
+    else:
+        import tempfile
+        d = Path(tempfile.gettempdir()) / f"meeting-transcriber-{os.getuid() if hasattr(os, 'getuid') else 'user'}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+class FileLock:
+    """One flock on one file of lock_dir(). flock belongs to an open file description, so two FileLocks exclude each
+    other in one process too. Without fcntl (Windows, where the LLM translators do not exist) it always succeeds; a lock
+    folder that cannot be made does too (nothing is worse than before 1.13.0). Process exit releases it in every case."""
+    def __init__(self, name):
+        self.name, self.fd, self.held = name, None, False
+
+    def _flock(self, flags):
+        try:
+            import fcntl
+        except ImportError:
+            return True
+        try:
+            if self.fd is None:
+                self.fd = os.open(str(lock_dir() / self.name), os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(self.fd, flags)
+            return True
+        except (BlockingIOError, PermissionError):
+            return False
+        except OSError:
+            return True
+
+    def try_take(self, shared=False):
+        if self.held:
+            return True
+        try:
+            import fcntl
+        except ImportError:
+            self.held = True
+            return True
+        self.held = self._flock((fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        return self.held
+
+    def take(self, shared=False):
+        """Blocks until it is held."""
+        if self.held:
+            return
+        try:
+            import fcntl
+        except ImportError:
+            self.held = True
+            return
+        self.held = self._flock(fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+
+    def free(self):
+        if self.fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd, self.held = None, False
+
+
+_SLOT = FileLock("llm.lock")         # held while this process has TranslateGemma or Hy-MT3 loaded (or loading)
+_WANT = FileLock("llm-want.lock")    # held by a live recording that waits for the slot: a final job then hands it over
+
+
+def _probe(name):
+    """Whether another holder has `name` (an exclusive try that is let go at once)."""
+    probe = FileLock(name)
+    free = probe.try_take()
+    probe.free()
+    return not free
+
+
+def live_waiting():
+    """A live recording waits for the translation model's slot (it holds llm-want.lock)."""
+    return _probe("llm-want.lock")
+
+
+def live_marker():
+    """Held (shared) by a live process while its worker exists: a processing job beside it then yields the GPU."""
+    marker = FileLock("live.lock")
+    marker.take(shared=True)     # blocking: a job's probe (live_running) holds it exclusively only for an instant
+    return marker
+
+
+def live_running():
+    return _probe("live.lock")
+
+
+_pause = time.sleep          # the GPU yield's sleep (a test replaces it)
+
+
+def gpu_yield(took):
+    """A processing job beside a live recording (live.lock held): after a chunk or a line it waits as long as that took,
+    at most 2 s, so its GPU duty is at most half and the recording's live transcript keeps its pace. Returns whether it
+    waited."""
+    if took <= 0 or not live_running():
+        return False
+    _pause(min(took, 2.0))
+    return True
+
+
+def take_llm_slot():
+    """Before TranslateGemma or Hy-MT3 is loaded by a processing job: the slot, waiting while a live recording holds it
+    or waits for it (llm-want.lock: the recording would take the free slot at its next try, within 2 s)."""
+    if _SLOT.held:                                     # this process has it already (a model loaded again after a hand-over)
+        return
+    wanted = not _WANT.held and live_waiting()
+    if not wanted and _SLOT.try_take():
+        return
+    text = "Waiting for the live translation of the recording in progress"
+    ev("STAGE", text) if EVENTS else print(text, file=sys.stderr)
+    while wanted and live_waiting():                   # until the recording has the slot (it stops wanting it then)
+        time.sleep(0.5)
+    _SLOT.take()
+
+
+def _mlx_clear_cache():
+    """MLX's buffer cache emptied after a model is let go (on the thread that owned it); nothing without MLX."""
+    mx = sys.modules.get("mlx.core")
+    if mx is None:
+        return
+    fn = getattr(mx, "clear_cache", None) or getattr(getattr(mx, "metal", None), "clear_cache", None)
+    try:
+        if callable(fn):
+            fn()
+    except Exception:
+        pass
 
 
 def check_name(name, what="name"):
@@ -740,8 +1029,16 @@ def record(name, hours, device, system_device=None, live=None, notes=None, check
         gate[0] = not gate[0]                  # takes effect in the next audio callback: nothing said after Pause is queued
         toggles.append(time.monotonic())
 
+    overflows = [0]                            # blocks the audio device dropped (sounddevice's input_overflow): @@STAT sys
+
     def capture(q):
-        return lambda x, *_, q=q: None if gate[0] else q.put(x.copy())
+        def callback(x, *rest, q=q):
+            status = rest[2] if len(rest) >= 3 else None
+            if status is not None and getattr(status, "input_overflow", False):
+                overflows[0] += 1
+            if not gate[0]:
+                q.put(x.copy())
+        return callback
 
     def on_cancel(signum, _):
         raise RecordingCancelled(signal.Signals(signum).name)
@@ -807,6 +1104,7 @@ def record(name, hours, device, system_device=None, live=None, notes=None, check
                                  speaker_name(names[k - 1], ("You", "Them")[k - 1]) if sys_wav else None, engine_name())
                        for k, (wav, _) in enumerate(tracks, 1)]
         worker = LiveWorker(live_tracks, targets=live.get("targets") or (), offline=live.get("offline", False))
+        worker.overflows = overflows
         worker.start()
     try:
         for (wav, dev), q in zip(tracks, queues):
@@ -1413,6 +1711,7 @@ def release_engine():
         holder.model = None
         holder.model_path = None
     gc.collect()
+    _mlx_clear_cache()
 
 
 def model_identity(engine):
@@ -1913,18 +2212,22 @@ def transcribe_lines(src, language=None, track=None, granularity="auto", speaker
         remembered = load_speed(speed_key)         # how long a chunk took last time: an estimate before the first one is done
         if remembered is not None:
             ev("ETA", round(remembered * (len(chunks) - len(done))))
+    sampler, yielded = SysSampler(), [False]
     for i, (a, b) in enumerate(chunks, 1):
         speech += (b - a) / RATE
+        took, signals = 0.0, {}
         if i in done:
             new = done[i]
         else:
+            t0 = time.monotonic()
             try:
                 new = decode_chunk(engine, audio[a:b], a, allowed, forced, speaker, adaptive=resolved == "adaptive",
-                                   context=context)
+                                   context=context, stats=signals)
             except Exception as e:                     # one bad chunk must not cost the hours already done
                 failed += 1
                 print(f"warning: chunk {i} at {hms(a / RATE)} failed: {type(e).__name__}: {e}", file=sys.stderr)
                 new = [{"t": round(a / RATE, 1), "note": f"chunk failed ({type(e).__name__}: {e})"}]
+            took = time.monotonic() - t0
             if cp:
                 cp.record(i, new)
             decoded += 1
@@ -1934,6 +2237,12 @@ def transcribe_lines(src, language=None, track=None, granularity="auto", speaker
         new = without_made_up(screened)
         hidden.extend(l for l in screened if l.get("made_up"))
         made += len(screened) - len(new)
+        chunk_stat = None
+        if EVENTS and i not in done:
+            spoken = [l for l in new if "text" in l]
+            chunk_stat = dict(src="final", track=position[0] - 1 if position else 0, i=i, a=a / RATE, b=b / RATE,
+                              dec_ms=int(took * 1000), rtf=(b - a) / RATE / took if took > 0 else None, lines=len(spoken),
+                              made_up=len(screened) - len(new), pending=len(chunks) - i, lang=_main_language(spoken), **signals)
         for line in new:                               # the chunk, or the pieces of a re-cut chunk, that gave nothing
             lost = re.match(r"speech not recognised for (\d+) s", str(line.get("note", "")))
             if lost:
@@ -1946,8 +2255,14 @@ def transcribe_lines(src, language=None, track=None, granularity="auto", speaker
                 ev("LINE", json.dumps(line, ensure_ascii=False))
             if decoded >= ETA_AFTER and i < len(chunks):
                 ev("ETA", round(sorted(chunk_times)[len(chunk_times) // 2] * (len(chunks) - i)))   # the median: start-up is in chunk 1
+            if chunk_stat:                             # telemetry after the chunk's own events
+                stat("chunk", **chunk_stat)
+            if sampler.due():
+                sampler.send(**{"yield": yielded[0]})
         else:
             print(f"\r{i}/{len(chunks)} chunks", end="", file=sys.stderr)
+        if took and gpu_yield(took):                   # a recording is live beside this job: half the GPU at most
+            yielded[0] = True
     if not EVENTS:
         print(file=sys.stderr)
     if len(chunk_times) >= ETA_AFTER:
@@ -2119,19 +2434,23 @@ class LiveTrack:
         return len(new)
 
     def decode(self, engine, translate=None):
-        """Decodes one pending chunk; returns its lines or None. `translate`, when given, is called with the lines once
-        they are shown and adds their translations (`tr`): the lines go out again with them, and the checkpoint records
-        them with the translations, so the final pass has those too."""
+        """Decodes one pending chunk; returns its lines or None. `translate`, when given, is called with the shown lines
+        (LiveTranslator.enqueue: it queues them and returns at once); their translations come later, each line sent again
+        with it, and the chunk is written to the checkpoint again then, so the final pass has them too. The chunk's
+        index and all its lines (the made-up ones too) are in `decoded_chunk` during that call."""
         if not self.pending:
             return None
         self._settle()
         a, b = self.pending.pop(0)
         i = self.chunks.index((a, b)) + 1
+        clock = getattr(self, "clock", None) or time.monotonic
+        signals, t0 = {}, clock()
         try:
             lines = decode_chunk(engine, self.audio[a - self.base:b - self.base], a, self.allowed, self.forced, self.speaker,
-                                 adaptive=self.granularity == "adaptive", context="recording")
+                                 adaptive=self.granularity == "adaptive", context="recording", stats=signals)
         except Exception as e:
             lines = [{"t": round(a / RATE, 1), "note": f"chunk failed ({type(e).__name__}: {e})"}]
+        took = clock() - t0
         if mark_repeated_outros(self, lines):          # an outro come again and again: its shown copies are withdrawn too
             self.withdrawn = True
             self._record_withdrawn()
@@ -2142,15 +2461,19 @@ class LiveTrack:
         if EVENTS:
             for line in shown:
                 ev("LINE", json.dumps(dict(line, live=True), ensure_ascii=False))
+        self.decoded_chunk = (i, lines)
         if translate and any("text" in l for l in shown):
-            translate(shown)                           # the line is on screen already; its translation follows
-            if EVENTS:
-                for line in shown:
-                    if "tr" in line:
-                        ev("LINE", json.dumps(dict(line, live=True), ensure_ascii=False))
+            translate(shown)                           # queued: the line is on screen already, its translation follows
         self.cp.record(i, lines)
         if EVENTS:
-            ev("POS", round(self.covered / RATE, 1), round(self.fed / RATE, 1))
+            fed = getattr(self, "fed", 0)
+            spoken = [l for l in shown if "text" in l]
+            stat("chunk", src="live", track=getattr(self, "index", 0), i=i, a=a / RATE, b=b / RATE, dec_ms=int(took * 1000),
+                 rtf=(b - a) / RATE / took if took > 0 else None, lines=len(spoken),
+                 made_up=sum(1 for l in lines if l.get("made_up")), pending=len(self.pending), fed_s=fed / RATE,
+                 lag_s=(fed - b) / RATE, lang=_main_language(spoken), **signals)
+            # Live: x of y counts what is decoded (the end of this chunk), not what is cut into chunks (1.13.0).
+            ev("POS", round(b / RATE, 1), round(fed / RATE, 1))
         return shown
 
     def _record_withdrawn(self):
@@ -2174,120 +2497,214 @@ class LiveTrack:
 class LiveWorker:
     """A thread that decodes the closed chunks of one or more live tracks, round-robin, as long as the recording runs.
     With `targets`, every decoded line is translated into them as well (offline with the local model beside the speech
-    model, or with Claude), so the window shows the translation beside the transcript while the meeting goes on."""
-    def __init__(self, tracks, targets=(), offline=False, source=None):
-        import threading
+    model, or with Claude), so the window shows the translation beside the transcript while the meeting goes on.
 
+    One thread owns the GPU (Whisper, Hy-MT3, TranslateGemma and their loads; mlx-lm's wired limit must not change while
+    another thread's work is in flight), and it never waits for a translation: step() decodes a pending chunk whenever
+    there is one, and otherwise does one step of the translation (LiveTranslator: one token, one load slice, one NLLB
+    batch, or a look at a request running on a helper thread). So a line is shown within CUT_EVERY_S plus one such step
+    of its chunk closing, whatever the translation costs (1.13.0; before, a chunk's every line was translated into every
+    target before the next chunk was decoded)."""
+    def __init__(self, tracks, targets=(), offline=False, source=None):
         self.tracks = tracks
         self.targets, self.offline, self.source = list(targets), offline, source
-        self.translation_off = False                   # set after a failure: said once, the rest is translated at the end
-        self.models_here = threading.Event()           # the translation models are on disk (fetched in the background)
-        self.models_loaded = False
-        self.waiting_told = False
+        self.clock = time.monotonic                    # a test's virtual clock goes here
         self.stop_flag = threading.Event()
         self.engine_ready = threading.Event()          # set once the speech model is loaded (until then nothing is written)
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.lines = 0
         self.failed = None                             # the error that ended the worker early, if one did
+        self.engine = None
+        self.current_track = None                      # the track whose chunk is being decoded (for the translator)
+        self.overflows = [0]                           # record() puts its count of dropped audio blocks here
+        self.marker = None
+        self.rr = 0
+        self.last_cut = None
+        self.just_decoded = False
+        self.speech_busy = 0.0                         # decode seconds since the last @@STAT sys
+        self.cut_ms = []
+        self.sampler = None
+        for k, track in enumerate(tracks):
+            try:
+                track.index = k                        # for @@STAT chunk
+                track.clock = lambda: self.clock()
+            except AttributeError:
+                pass
+        self.translator = LiveTranslator(self)
+
+    # What 1.12.0's callers and tests read on the worker; the translator holds it now.
+    @property
+    def translation_off(self):
+        return self.translator.off
+
+    @translation_off.setter
+    def translation_off(self, value):
+        self.translator.off = value
+
+    @property
+    def models_here(self):
+        return self.translator.models_here
+
+    @property
+    def models_loaded(self):
+        return self.translator.ready
+
+    @property
+    def waiting_told(self):
+        return self.translator.waiting_told
 
     def start(self):
+        self.marker = live_marker()                    # a processing job beside this recording yields the GPU (gpu_yield)
         self.thread.start()
 
     def fetch_models(self):
-        """On a thread of its own: the translation models downloaded if they are not here yet (7 GB for TranslateGemma,
-        4.2 GB for Hy-MT3 the first time), so that neither the recording nor the live transcript waits for them. A chunk
-        decoded meanwhile gets no live translation; the final pass translates it."""
-        try:
-            for repo, size in translation_models(self.targets, self.offline):
-                try:
-                    fetch_model(repo, size, stage=False)
-                except Exception as e:
-                    if repo == NLLB and llm_on():      # TranslateGemma's or Hy-MT3's lines go on; NLLB's wait for the end
-                        print(f"NLLB could not be fetched ({type(e).__name__}); the lines {llm_label()} does not cover "
-                              "are translated at the end", file=sys.stderr)
-                        continue
-                    raise
-        except Exception as e:
-            self.translation_off = True
-            note(f"Live translation is off ({type(e).__name__}: {e}): the translation model could not be fetched; "
-                 "the lines are transcribed live and translated when the recording ends")
-        finally:
-            self.models_here.set()
+        self.translator.fetch_models()
 
     def load_models(self):
-        """On the worker's own thread, between two chunks (the model's GPU work stays on one thread): the model that
-        takes most lines, TranslateGemma or Hy-MT3 when a target is one of its languages, else NLLB."""
-        if llm_on() and any(llm_code(t) for t in self.targets):
-            if TRANSLATOR == "hy" and HY == HY_DEFAULT:
-                fetch_hy(stage=False, refetch=False)   # checked here first: a file to download again waits for the final pass
-            get_llm(keep_engine=True)
-        else:
-            get_nllb(keep_engine=True)
+        self.translator.load_models()
 
     def translate(self, lines):
-        """Adds the targets' translations to the lines of one chunk; a failure (no network, the model would not load)
-        ends the live translation with a note, not the recording."""
-        if not self.targets or self.translation_off:
+        """Queues the targets' translations of the lines of one chunk (LiveTranslator.enqueue); returns at once."""
+        self.translator.enqueue(lines)
+
+    def _cap_mlx_cache(self, engine):
+        """In a live process MLX's buffer cache is capped (MT_MLX_CACHE_MB, 1 GB): unbounded, it may grow to nearly the
+        recommended working set beside a 7B translator."""
+        mx = getattr(engine, "mx", None)
+        if getattr(engine, "name", None) != "mlx" or mx is None:
             return
-        if self.offline and not self.models_loaded:
-            if not self.models_here.is_set():
-                if not self.waiting_told:
-                    self.waiting_told = True
-                    print("Live translation starts once the translation model is downloaded; until then the lines are "
-                          "translated at the end", file=sys.stderr)
-                return
-            if self.translation_off:
-                return
-            try:
-                self.load_models()
-                self.models_loaded = True
-            except Exception as e:                     # no memory, a broken download: the transcript goes on live
-                self.translation_off = True
-                note(f"Live translation is off ({type(e).__name__}: {e}): the translation model could not be loaded; "
-                     "the lines are transcribed live and translated when the recording ends")
-                return
+        fn = getattr(mx, "set_cache_limit", None) or getattr(getattr(mx, "metal", None), "set_cache_limit", None)
         try:
-            translate_live(lines, self.targets, self.offline, self.source)
+            if callable(fn):
+                fn(MLX_CACHE_MB << 20)
         except Exception as e:
-            self.translation_off = True
-            note(f"Live translation stopped ({type(e).__name__}: {e}); the translation is made when the recording ends")
+            print(f"warning: the MLX cache limit could not be set ({type(e).__name__}: {e})", file=sys.stderr)
 
     def run(self):
         try:
+            started = time.monotonic()
             engine = get_engine()
-            if self.targets and self.offline:          # the translation models: here already, or fetched beside the work
-                import threading
-                if all(model_present(repo) for repo, _ in translation_models(self.targets, self.offline)):
-                    self.models_here.set()
-                else:
-                    threading.Thread(target=self.fetch_models, daemon=True).start()
+            self.engine = engine
+            stat("model", role="speech", name=mlx_repo() if getattr(engine, "name", None) == "mlx" else WHISPER,
+                 engine=getattr(engine, "name", None), state="ready", load_ms=int((time.monotonic() - started) * 1000))
+            self._cap_mlx_cache(engine)
+            self.translator.start(engine)
             self.engine_ready.set()
             if self.stop_flag.is_set():                # stopped while the model loaded: the final pass does everything
+                self.translator.halt()
                 return
-            while True:
-                worked = False
-                for track in self.tracks:
-                    track.cut()
-                    lines = track.decode(engine, translate=self.translate) if self.targets else track.decode(engine)
-                    if lines is not None:
-                        worked = True
-                        self.lines += sum(1 for l in lines if "text" in l)
-                    if any(getattr(t, "withdrawn", False) for t in self.tracks):
-                        self.resend()
-                if not worked:
-                    if self.stop_flag.is_set():
-                        for track in self.tracks:      # the recording is over: what is closed now is decoded too
-                            track.cut(final=False)
-                        if not any(t.pending for t in self.tracks):
-                            break
-                    else:
-                        self.stop_flag.wait(1.0)
+            self.sampler = SysSampler(self.clock)
+            while not self.stop_flag.is_set():
+                if not self.step():
+                    self.stop_flag.wait(self.idle_wait())
+            self.drain()
         except Exception as e:                         # the model could not be loaded, the VAD failed …: said, not silent
             self.failed = e
             self.engine_ready.set()
             if EVENTS:                                 # the window stops saying that the model is loading
                 ev("CHECK", "live", "failed")
             note(f"Live transcription stopped ({type(e).__name__}: {e}); the recording goes on and everything is transcribed at the end")
+            try:
+                self.translator.halt()
+            except Exception:
+                pass
+
+    def idle_wait(self):
+        """How long run() waits when step() found nothing to do: until the next look for chunks (CUT_EVERY_S), or a
+        short while when a translation is under way on a helper thread or waits for its turn."""
+        now = self.clock()
+        until_cut = CUT_EVERY_S if self.last_cut is None else max(0.0, self.last_cut + CUT_EVERY_S - now)
+        return max(0.005, min(until_cut, 0.05 if self.translator.active() else CUT_EVERY_S))
+
+    def _next_track(self):
+        n = len(self.tracks)
+        for k in range(n):
+            track = self.tracks[(self.rr + k) % n]
+            if getattr(track, "pending", None):
+                self.rr = (self.rr + k + 1) % n
+                return track
+        return None
+
+    def _cut(self, final=False):
+        t0 = time.perf_counter()
+        for track in self.tracks:
+            track.cut(final=final)
+        self.cut_ms.append((time.perf_counter() - t0) * 1000)
+
+    def _decode(self, track):
+        self.current_track = track
+        t0 = self.clock()
+        lines = track.decode(self.engine, translate=self.translate) if self.targets else track.decode(self.engine)
+        self.speech_busy += self.clock() - t0
+        if lines is not None:
+            self.lines += sum(1 for l in lines if "text" in l)
+        if any(getattr(t, "withdrawn", False) for t in self.tracks):
+            self.resend()
+        if self.translator.suspended() and getattr(self.engine, "name", None) == "mlx":
+            # A translation is suspended between two tokens: its one token in flight is done before anything else runs
+            # (belt and braces; Whisper's results are read back already, so this costs about nothing).
+            sync = getattr(getattr(self.engine, "mx", None), "synchronize", None)
+            if callable(sync):
+                sync()
+        return lines
+
+    def step(self):
+        """One decision of the scheduler, on the worker's thread: look for chunks to close (every CUT_EVERY_S, and after
+        each decode), then decode the next pending chunk (round-robin over the tracks) if there is one, else do one step
+        of the translation. Returns whether it did any work."""
+        now = self.clock()
+        if self.last_cut is None or self.just_decoded or now - self.last_cut >= CUT_EVERY_S:
+            self._cut()
+            self.last_cut = now
+        track = self._next_track()
+        if track is not None:
+            self._decode(track)
+            self.just_decoded = True
+            self._telemetry()
+            return True
+        self.just_decoded = False
+        worked = False
+        if self.targets:
+            try:
+                worked = self.translator.step(now)
+            except Exception as e:                     # the transcript goes on; the translation is made at the end
+                self.translator.fail(e)
+                worked = True
+        self._telemetry()
+        return worked
+
+    def _telemetry(self):
+        if not EVENTS:
+            return
+        if self.targets:
+            self.translator.queue_stat()
+        if self.sampler is None:
+            self.sampler = SysSampler(self.clock)
+        if self.sampler.due():
+            cut = self.cut_ms
+            self.sampler.send(cut_ms=sum(cut) / len(cut) if cut else None, duty_speech=self.speech_busy,
+                              duty_tr=self.translator.take_busy() if self.targets else 0.0,
+                              audio_overflows=self.overflows[0], **{"yield": False})
+            self.speech_busy, self.cut_ms = 0.0, []
+
+    def drain(self):
+        """After the stop: the translation stops at once (what is queued is left to the final pass, which makes the same
+        text with the same model), and the pending speech chunks are decoded for at most LIVE_DRAIN_S. A chunk left
+        undecoded is not in the checkpoint's records, so the final pass decodes it."""
+        self.translator.halt()
+        started = self.clock()
+        while True:
+            self._cut()
+            track = self._next_track()
+            if track is None:
+                break
+            if self.clock() - started >= LIVE_DRAIN_S:
+                left = sum(len(getattr(t, "pending", [])) for t in self.tracks)
+                print(f"Finishing the live transcript took more than {LIVE_DRAIN_S} s: the {left} chunk(s) left are "
+                      "transcribed now with the rest", file=sys.stderr)
+                break
+            self._decode(track)
+            self._telemetry()
 
     def resend(self):
         """The window again without the lines withdrawn since they were shown (an outro said again and again): @@CLEAR,
@@ -2305,7 +2722,8 @@ class LiveWorker:
 
     def stop(self, wait=120):
         """Ends the worker and waits for it: its checkpoint is handed to the final pass only once nothing writes to it. A
-        worker still loading the speech model has written nothing and is not waited for (the final pass does the work)."""
+        worker still loading the speech model has written nothing and is not waited for (the final pass does the work).
+        The worker stops translating at once and decodes for at most LIVE_DRAIN_S (drain)."""
         self.stop_flag.set()
         self.thread.join(wait)
         if self.thread.is_alive() and not self.engine_ready.is_set():
@@ -2316,6 +2734,690 @@ class LiveWorker:
                 self.thread.join(wait)
         for track in self.tracks:
             track.close()
+        if self.marker is not None:                    # no recording is live here any more: a job need not yield to it
+            self.marker.free()
+            self.marker = None
+
+
+class _Job:
+    """One unit of the live translation: one line into one target (TranslateGemma, Hy-MT3), or the lines of one chunk
+    into one target (NLLB, Claude)."""
+    __slots__ = ("kind", "target", "lines", "pair", "track", "chunk", "end", "seq", "enqueued", "started", "gen", "future",
+                 "active", "prefill", "stats", "first")
+
+    def __init__(self, kind, target, lines, track, chunk, seq, enqueued, pair=None):
+        self.kind, self.target, self.lines, self.pair, self.track, self.chunk = kind, target, lines, pair, track, chunk
+        self.end = max(float(l.get("end", l.get("t", 0.0)) or 0.0) for l in lines)
+        self.seq, self.enqueued, self.started = seq, enqueued, None
+        self.gen = self.future = None
+        self.active, self.prefill, self.stats, self.first = 0.0, None, {}, True
+
+    def key(self):
+        return (self.end, self.seq)
+
+
+class LiveTranslator:
+    """The live translation of a LiveWorker: the queue of jobs, the one in progress, the model's state and its helper
+    threads. Everything that touches MLX or a line runs on the worker's thread (step, enqueue, halt); the prepare
+    thread downloads, checks the files, loads the tokenizer and NLLB, and warms the page cache, and calls no MLX; a
+    daemon helper thread (_DaemonHelper) runs Claude's requests and, beside the GPU engine, NLLB on the CPU.
+
+    The model's states (@@STAT model and queue): off -> downloading -> checking -> waiting (another process has the
+    translation model's slot) -> loading (progress) -> ready <-> behind; failed; nllb (a low-memory Mac); stopped."""
+    def __init__(self, worker):
+        self.w = worker
+        self.targets, self.offline, self.source = worker.targets, worker.offline, worker.source
+        self.off = False                               # after a failure: said once, the rest is translated at the end
+        self.models_here = threading.Event()           # the models are on disk (fetched in the background)
+        self.prepared = threading.Event()              # the prepare thread is done (or there was nothing to prepare)
+        self.waiting_told = False
+        self.ready = False
+        self.stopped = False
+        self.state = "off"
+        self.queue = []                                # jobs not started, by line end (then as queued)
+        self.current = None
+        self.seq = 0
+        self.chunks = {}                               # (id(track), i) -> [track, i, lines, open jobs, dirty]
+        self.newest = {}                               # id(track) -> the newest chunk index enqueued
+        self.translated = self.skipped = 0
+        self.work = collections.deque()              # (when, seconds) of translation work in the trailing minute
+        self.active_sum = 0.0
+        self.busy = 0.0                                # seconds of translation work since the last @@STAT sys
+        self.started_at = None
+        self.last_skip = None
+        self.last_skip_told = False
+        self.last_queue = None
+        self.last_progress = None
+        self.duty_blocked = False
+        self.llm = None                                # the prepare thread's parts: model folder, tokenizer, bytes
+        self.model = self.tok = None
+        self.loader = None
+        self.load_started = None
+        self.next_slot_try = 0.0
+        self.nllb = None                               # NLLB (translator, tokenizer) once loaded
+        self.executor = None
+        self.engine = None
+        self.low_memory = None
+        total = total_memory() if offline_llm(self.targets, self.offline) else None
+        if total and total < (12 if TRANSLATOR == "hy" else 16) * 2**30:   # the thresholds of preflight's advice
+            self.low_memory = total
+        self.use_llm = offline_llm(self.targets, self.offline) and not self.low_memory
+        if self.targets and not self.offline:          # Claude: nothing to load
+            self.models_here.set()
+            self.prepared.set()
+            self.ready = True
+            self.state = "ready"
+
+    # ---- the model ----
+    def model_name(self):
+        return CLAUDE if not self.offline else llm_repo() if self.use_llm else NLLB
+
+    def set_state(self, state, **fields):
+        changed = state != self.state
+        self.state = state
+        if changed or fields:
+            stat("model", role="translator", name=self.model_name(),
+                 engine="api" if not self.offline else "mlx" if self.use_llm else "ct2", state=state, **fields)
+        if changed:
+            self.queue_stat(force=True)
+
+    def start(self, engine):
+        """On the worker's thread once the speech model is loaded: the model's preparation starts beside the work at
+        once (not at the first line, which used to stop the transcript for the whole load)."""
+        self.engine = engine
+        self.started_at = self.w.clock()
+        if not self.targets:
+            return
+        if not self.offline:
+            self.set_state("ready")
+            return
+        if self.low_memory:
+            print(f"On this {self.low_memory // 2**30} GB Mac the live translation uses NLLB; {llm_label()} translates at "
+                  "the end", file=sys.stderr)
+            stat("model", role="translator", name=llm_repo(), engine="mlx", state="nllb")
+        if self.use_llm:
+            try:
+                import mlx_lm  # noqa: F401  mlx-lm makes its generation stream when imported: on this thread, not the prepare thread's
+            except Exception as e:
+                self.fail_load(e)
+                self.prepared.set()
+                return
+        threading.Thread(target=self.prepare, daemon=True).start()
+
+    def fetch_models(self):
+        """On a thread of its own: the translation models downloaded if they are not here yet (7 GB for TranslateGemma,
+        4.2 GB for Hy-MT3 the first time), so that neither the recording nor the live transcript waits for them."""
+        try:
+            for repo, size in translation_models(self.targets, self.offline):
+                try:
+                    fetch_model(repo, size, stage=False)
+                except Exception as e:
+                    if repo == NLLB and llm_on():      # TranslateGemma's or Hy-MT3's lines go on; NLLB's wait for the end
+                        print(f"NLLB could not be fetched ({type(e).__name__}); the lines {llm_label()} does not cover "
+                              "are translated at the end", file=sys.stderr)
+                        continue
+                    raise
+        except Exception as e:
+            self.off = True
+            self.set_state("failed", error=f"{type(e).__name__}: {e}")
+            note(f"Live translation is off ({type(e).__name__}: {e}): the translation model could not be fetched; "
+                 "the lines are transcribed live and translated when the recording ends")
+        finally:
+            self.models_here.set()
+
+    def _download_progress(self, done):
+        """@@STAT model downloading with the bytes so far, twice a second: the size of the partial files in the Hugging
+        Face cache (best effort: huggingface_hub writes a download to blobs/<hash>.incomplete); the total is known for
+        the pinned Hy-MT3 files only."""
+        repos = [repo for repo, _ in translation_models(self.targets, self.offline)]
+        total = sum(size for repo, _, _, size, _ in HY_FILES) if TRANSLATOR == "hy" and HY == HY_DEFAULT and self.use_llm else None
+        while not done.wait(0.5):
+            got = hf_partial_bytes(repos)
+            if got is not None:
+                stat("model", role="translator", name=self.model_name(), engine="mlx" if self.use_llm else "ct2",
+                     state="downloading", done_bytes=got, total_bytes=total,
+                     progress=min(1.0, got / total) if total else None)
+
+    def prepare(self):
+        """The prepare thread: all the I/O and CPU work of the translation model, and no MLX. Downloads (fetch_models),
+        the pinned Hy-MT3 files' check (once per process: _HY_FILES_CHECKED), the tokenizer, the page cache warmed with
+        the weights, and NLLB when it is the translator. The worker then evaluates the weights in slices."""
+        try:
+            if not all(model_present(repo) for repo, _ in translation_models(self.targets, self.offline)):
+                self.set_state("downloading")
+                done = threading.Event()
+                threading.Thread(target=self._download_progress, args=(done,), daemon=True).start()
+                try:
+                    self.fetch_models()
+                finally:
+                    done.set()
+            else:
+                self.models_here.set()
+            if self.off or self.stopped:
+                return
+            try:
+                if self.use_llm:
+                    self.set_state("checking")
+                    self.llm = llm_live_parts(lambda: self.stopped)
+                else:
+                    self.set_state("loading")
+                    started = time.monotonic()
+                    self.nllb = get_nllb(keep_engine=True)
+                    self.set_state("nllb" if self.low_memory else "ready", load_ms=int((time.monotonic() - started) * 1000))
+                    self.ready = True
+            except Exception as e:                     # no memory, a broken download: the transcript goes on live
+                self.fail_load(e)
+        finally:
+            self.prepared.set()
+
+    def fail_load(self, e):
+        self.off = True
+        self.set_state("failed", error=f"{type(e).__name__}: {e}")
+        note(f"Live translation is off ({type(e).__name__}: {e}): the translation model could not be loaded; "
+             "the lines are transcribed live and translated when the recording ends")
+
+    def load_models(self):
+        """The 1.12.0 way, all at once on the caller's thread: the model that takes most lines, TranslateGemma or Hy-MT3
+        when a target is one of its languages, else NLLB."""
+        if llm_on() and any(llm_code(t) for t in self.targets):
+            if TRANSLATOR == "hy" and HY == HY_DEFAULT:
+                fetch_hy(stage=False, refetch=False)   # checked here first: a file to download again waits for the final pass
+            get_llm(keep_engine=True)
+        else:
+            get_nllb(keep_engine=True)
+
+    def _load_step(self, now):
+        """One step of TranslateGemma's or Hy-MT3's load on the worker's thread: take the slot (or wait for it), build
+        the model with lazy weights, or evaluate one slice of them. Returns whether it did work. A failure (no memory)
+        ends the live translation with a note; the transcript goes on."""
+        try:
+            return self._load_one(now)
+        except Exception as e:
+            self.loader = None
+            self.model = None
+            _mlx_clear_cache()
+            _SLOT.free()
+            _WANT.free()
+            self.fail_load(e)
+            return True
+
+    def _load_one(self, now):
+        if self.model is None:
+            if now < self.next_slot_try:
+                return False
+            if not _SLOT.try_take():                   # a processing job has the model loaded: it hands it over
+                _WANT.try_take()
+                if self.state != "waiting":
+                    self.set_state("waiting")
+                self.next_slot_try = now + 2.0
+                return False
+            _WANT.free()
+            self.load_started = now
+            self.set_state("loading", progress=0.0, bytes=self.llm.bytes)
+            t0 = self.w.clock()
+            self.model = llm_live_model(self.llm.path)
+            self.loader = eval_in_slices(self.model)
+            self.add_busy(t0, duty=False)
+            return True
+        t0 = self.w.clock()
+        try:
+            done, total = next(self.loader)
+        except StopIteration:
+            self.loader = None
+            self.tok = self.llm.tok
+            self.ready = True
+            self.set_state("ready", progress=1.0, load_ms=int((self.w.clock() - self.load_started) * 1000), bytes=self.llm.bytes)
+            return True
+        self.add_busy(t0, duty=False)
+        progress = done / total if total else 1.0
+        if progress >= 1.0 or self.last_progress is None or self.w.clock() - self.last_progress >= 0.5:
+            self.last_progress = self.w.clock()
+            stat("model", role="translator", name=self.model_name(), engine="mlx", state="loading", progress=progress,
+                 done_bytes=done, total_bytes=total)
+        return True
+
+    # ---- the queue ----
+    def enqueue(self, shown):
+        """Called by LiveTrack.decode with the shown lines of one chunk (on the worker's thread): one job per line and
+        target for TranslateGemma or Hy-MT3 (a line already in the target gets its text at once), one per chunk and
+        target for NLLB and Claude. Returns at once."""
+        if not self.targets:
+            return
+        spoken = [l for l in shown if "text" in l]
+        if not spoken:
+            return
+        track = self.w.current_track
+        info = getattr(track, "decoded_chunk", None) if track is not None else None
+        i, lines = info if info else (None, shown)
+        if self.off or self.stopped:
+            self.skip_lines([(l, list(self.targets)) for l in spoken], "stop" if self.stopped else "off")
+            return
+        if self.offline and not self.models_here.is_set() and not self.waiting_told:
+            self.waiting_told = True
+            print("Live translation starts once the translation model is downloaded; until then the lines are "
+                  "translated at the end", file=sys.stderr)
+        now = self.w.clock()
+        jobs, at_once = [], []
+        for target in self.targets:
+            rest = []
+            for line in spoken:
+                pair = llm_pair(line.get("lang"), target, self.source) if self.use_llm else None
+                if pair and same_language(*pair):     # already in the target: its own text, at once (as translate_texts)
+                    self.apply(line, target, line["text"], llm_repo())
+                    at_once.append(line)
+                elif pair:
+                    jobs.append(_Job("llm", target, [line], track, i, self._seq(), now, pair=pair))
+                else:
+                    rest.append(line)
+            if rest:
+                if self.use_llm and _NLLB_FAILED:      # NLLB could not be loaded beside the model: those wait for the end
+                    self.skip_lines([(l, [target]) for l in rest], "off")
+                else:
+                    jobs.append(_Job("nllb" if self.offline else "claude", target, rest, track, i, self._seq(), now))
+        if EVENTS:
+            for line in {id(l): l for l in at_once if not l.get("made_up")}.values():
+                ev("LINE", json.dumps(dict(line, live=True, tr_ms={t: 0 for t in (line.get("tr") or {})}), ensure_ascii=False))
+        if i is not None and track is not None:
+            entry = self.chunks.setdefault((id(track), i), [track, i, lines, 0, False])
+            entry[3] += len(jobs)
+            entry[4] = entry[4] or bool(at_once)
+            self.newest[id(track)] = max(i, self.newest.get(id(track), 0))
+        for job in jobs:
+            import bisect
+            keys = [j.key() for j in self.queue]
+            self.queue.insert(bisect.bisect(keys, job.key()), job)
+
+    def _seq(self):
+        self.seq += 1
+        return self.seq
+
+    def apply(self, line, target, text, by):
+        """A translation onto its line, exactly as translate_live puts it (tr, tr_of, tr_by, tr_offline)."""
+        line.setdefault("tr", {})[target] = text
+        line["tr_of"] = line["text"]
+        line.setdefault("tr_by", {})[target] = by
+        line["tr_offline"] = bool(self.offline)
+
+    def _chunk_done(self, job, changed):
+        """One job of a chunk finished or was left out: once its chunk has none left, the chunk is written to the
+        checkpoint again with its translations (resume keeps a chunk's last record)."""
+        if job.chunk is None or job.track is None:
+            return
+        entry = self.chunks.get((id(job.track), job.chunk))
+        if entry is None:
+            return
+        entry[3] -= 1
+        entry[4] = entry[4] or changed
+        if entry[3] <= 0:
+            del self.chunks[(id(job.track), job.chunk)]
+            if entry[4]:
+                self._record(entry)
+
+    def _record(self, entry):
+        cp = getattr(entry[0], "cp", None)
+        if cp is not None:
+            cp.record(entry[1], entry[2])
+
+    def flush_records(self):
+        """At the stop: every chunk with a translation not yet written is written again."""
+        for key, entry in list(self.chunks.items()):
+            if entry[4]:
+                self._record(entry)
+            del self.chunks[key]
+
+    def skip_lines(self, items, reason, jobs=()):
+        """Lines left to the final pass: each sent once with tr_skip (event only), and one @@STAT trskip. A line withdrawn
+        from the window since it was queued (made_up: an outro said again and again, then @@CLEAR) is not sent again: the
+        final pass leaves it out too."""
+        merged = {}
+        for line, targets in items:
+            if line.get("made_up"):
+                continue
+            merged.setdefault(id(line), [line, []])
+            merged[id(line)][1].extend(t for t in targets if t not in merged[id(line)][1])
+        if not merged:
+            return
+        self.skipped += len(merged)
+        if EVENTS:
+            for line, targets in merged.values():
+                ev("LINE", json.dumps(dict(line, live=True, tr_skip=targets), ensure_ascii=False))
+        stat("trskip", reason=reason, lines=len(merged), targets=list(dict.fromkeys(t for _, ts in merged.values() for t in ts)),
+             total=self.skipped)
+
+    def _skip_jobs(self, jobs, reason):
+        self.skip_lines([(l, [job.target]) for job in jobs for l in job.lines], reason)
+        for job in jobs:
+            self._chunk_done(job, False)
+
+    def behind(self, job):
+        """How far a job's lines are behind the audio fed to their track, in audio seconds."""
+        return getattr(job.track, "fed", 0) / RATE - job.end if job.track is not None else 0.0
+
+    def _skip_to_newest(self, now):
+        """When the oldest queued job is more than LIVE_TR_BEHIND_S behind, every queued job of a chunk older than its
+        track's newest decoded chunk is left to the final pass: the translations come back to "now" (a job already
+        started is finished). A job that has waited in the queue longer than LIVE_TR_BEHIND_S goes too (its chunk may be
+        the newest when nobody speaks): started, it would come later than G2's bound (measured in the lag grid: 43 s on
+        a call at 6 s a line). The state is `behind` until no skip has happened for 60 s."""
+        if self.state == "behind" and (self.last_skip is None or now - self.last_skip > 60):
+            self.set_state("ready")                    # (only a ready translator is ever behind: see below)
+        if not self.queue:
+            return
+        behind = self.behind(self.queue[0]) > LIVE_TR_BEHIND_S
+        old = [j for j in self.queue if (behind and j.chunk is not None and j.track is not None and j.chunk < self._newest(j.track))
+               or now - j.enqueued > LIVE_TR_BEHIND_S]
+        if not old:
+            return
+        gone = {id(j) for j in old}
+        self.queue = [j for j in self.queue if id(j) not in gone]
+        lines = len({id(l) for j in old for l in j.lines})
+        # Why they aged: waiting for the slot another process holds, the duty cap, or the translation being slower.
+        self._skip_jobs(old, "slot" if self.state == "waiting" else "duty" if self.duty_blocked else "behind")
+        self.last_skip = now
+        if self.state != "behind" and (self.ready or not self.last_skip_told):
+            self.last_skip_told = True
+            print(f"Live translation is behind: {lines} lines are left for the translation at the end", file=sys.stderr)
+            if self.ready:                             # while downloading or loading, that state stays on show
+                self.set_state("behind")
+
+    def _newest(self, track):
+        """The index of the newest chunk decoded on a track (chunks are decoded in order)."""
+        chunks, pending = getattr(track, "chunks", None), getattr(track, "pending", None)
+        if isinstance(chunks, list) and isinstance(pending, list):
+            return len(chunks) - len(pending)
+        return self.newest.get(id(track), 0)
+
+    def duty(self, now):
+        while self.work and self.work[0][0] < now - 60:
+            self.active_sum -= self.work.popleft()[1]
+        return self.active_sum
+
+    def add_busy(self, t0, job=None, duty=True):
+        """Time spent on the worker's thread: in @@STAT sys duty_tr, and (not a load's: duty=False) in the trailing
+        minute's duty that LIVE_TR_DUTY caps, so the jobs that waited during a load are not held back by it."""
+        now = self.w.clock()
+        d = max(0.0, now - t0)
+        if duty:
+            self.work.append((now, d))
+            self.active_sum += d
+        self.busy += d
+        if job is not None:
+            job.active += d
+        return d
+
+    def take_busy(self):
+        busy, self.busy = self.busy, 0.0
+        return busy
+
+    def active(self):
+        """Whether a step could do something soon (run() then waits only a short while)."""
+        if self.off or self.stopped:
+            return False
+        if self.current is not None or self.loader is not None:
+            return True
+        if self.prepared.is_set() and not self.ready and self.use_llm:
+            return True
+        return bool(self.queue) and self.ready
+
+    def suspended(self):
+        return self.current is not None and self.current.gen is not None
+
+    def has_work(self):
+        """Queued or running work, or a model still to prepare (for a test that drives the steps itself)."""
+        if self.off or self.stopped:
+            return False
+        return bool(self.queue) or self.current is not None or not self.prepared.is_set() or (self.use_llm and not self.ready)
+
+    # ---- one step ----
+    def step(self, now):
+        """One unit of translation work; returns whether it did any."""
+        if not self.targets or self.stopped:
+            return False
+        if self.off:
+            if self.queue or self.current is not None:
+                self._drop(self.queue + ([self.current] if self.current is not None else []), "off")
+            return False
+        if not self.ready:
+            self._skip_to_newest(now)                  # lines queued during a long download or load age too (A5)
+            if not self.prepared.is_set() or not self.use_llm:
+                return False
+            return self._load_step(now)
+        if self.current is not None:
+            return self._advance()
+        self._skip_to_newest(now)
+        if not self.queue:
+            return False
+        self.duty_blocked = self.duty(now) > LIVE_TR_DUTY * 60.0   # the jobs that wait age, and the rule above skips them
+        if self.duty_blocked:
+            return False
+        job = self.queue.pop(0)
+        job.started = now
+        self._begin(job)
+        self.current = job
+        return self._advance()
+
+    def _begin(self, job):
+        if job.kind == "llm":
+            _thread_stream()                           # mlx-lm's generation stream on this thread
+            if TRANSLATOR == "hy":
+                job.gen = hy_steps(job.pair[0], job.lines[0]["text"], llm_code(job.target), self.model, self.tok, job.stats)
+            else:
+                job.gen = gemma_steps(job.pair[0], job.lines[0]["text"], llm_code(job.target), self.model, self.tok, job.stats)
+        elif job.kind == "nllb":
+            if getattr(self.engine, "name", None) != "mlx" and self.nllb is not None:
+                job.gen = _nllb_text_steps(job.lines, job.target, self.source, self.nllb)    # inline: Whisper is on the CPU too
+            else:                                      # beside the GPU engine: on the CPU, on the helper thread
+                nllb = self.nllb
+                job.future = self._executor().submit(lambda: _collect(_nllb_text_steps(job.lines, job.target, self.source, nllb)))
+        else:
+            job.future = self._executor().submit(translate_texts, job.lines, job.target, False, self.source)
+
+    def _executor(self):
+        if self.executor is None:
+            self.executor = _DaemonHelper("mt-live-helper")
+        return self.executor
+
+    def _advance(self):
+        job = self.current
+        if job.future is not None:
+            if not job.future.done():
+                return False
+            self.current = None
+            try:
+                result = job.future.result()
+            except Exception as e:
+                if job.kind == "nllb" and self.use_llm:  # NLLB beside the model: its lines wait for the final pass
+                    _NLLB_FAILED.append(e)
+                    print(f"NLLB could not be loaded ({type(e).__name__}: {e}); the lines {llm_label()} does not cover are "
+                          "translated at the end", file=sys.stderr)
+                    self._skip_jobs([job], "off")
+                    return True
+                self.fail(e, job)
+                return True
+            job.active = max(job.active, self.w.clock() - job.started)
+            self._finish(job, result)
+            return True
+        t0 = self.w.clock()
+        try:
+            next(job.gen)
+        except StopIteration as done:
+            self.add_busy(t0, job)
+            self.current = None
+            self._finish(job, done.value)
+            return True
+        except Exception as e:
+            self.current = None
+            self.fail(e, job)
+            return True
+        d = self.add_busy(t0, job)
+        if job.first:
+            job.first, job.prefill = False, d
+        return True
+
+    def _finish(self, job, value):
+        if job.kind == "llm":
+            text, cut = value if TRANSLATOR == "hy" else (value, False)
+            if cut:
+                print("1 line(s) ran to the token limit and may be cut short or repeat", file=sys.stderr)
+            texts, by = [text], llm_repo()
+        else:
+            texts, by = value, NLLB if job.kind == "nllb" else "claude"
+        ms = int(job.active * 1000)
+        changed = False
+        for line, text in zip(job.lines, texts):
+            if text is None:
+                continue
+            self.apply(line, job.target, text, by)
+            changed = True
+            if EVENTS and not line.get("made_up"):   # withdrawn since it was queued (resend): not shown again
+                ev("LINE", json.dumps(dict(line, live=True, tr_ms={job.target: ms}), ensure_ascii=False))
+        self.translated += len(job.lines)
+        if EVENTS:
+            st = job.stats
+            gen_s = job.active - (job.prefill or 0.0)
+            stat("tr", src="live", track=getattr(job.track, "index", 0), t=job.lines[0].get("t"), target=job.target,
+                 model=("hy" if TRANSLATOR == "hy" else "gemma") if job.kind == "llm" else job.kind, lines=len(job.lines),
+                 ms=ms, wait_ms=int(max(0.0, job.started - job.enqueued) * 1000),
+                 prefill_ms=int(job.prefill * 1000) if job.prefill is not None else None, in_tok=st.get("in_tok"),
+                 out_tok=st.get("out_tok"), tps=st["out_tok"] / gen_s if st.get("out_tok") and gen_s > 0 else None,
+                 finish=st.get("finish"), lag_s=self.behind(job), queue=len(self.queue))
+        self._chunk_done(job, changed)
+
+    def _drop(self, jobs, reason):
+        for job in jobs:
+            if job.gen is not None:
+                try:
+                    job.gen.close()                    # runs mlx-lm's wired_limit finally: synchronizes, restores the limit
+                except Exception:
+                    pass
+        self.current = None
+        self.queue = []
+        self._skip_jobs(jobs, reason)
+
+    def fail(self, e, job=None):
+        """A translation failed (no network, the model): the live translation ends with a note, the transcript goes on."""
+        if self.off:
+            return
+        self.off = True
+        note(f"Live translation stopped ({type(e).__name__}: {e}); the translation is made when the recording ends")
+        self.set_state("failed", error=f"{type(e).__name__}: {e}")
+        self._drop(([job] if job is not None else []) + ([self.current] if self.current is not None else []) + self.queue,
+                   "off")
+
+    def queue_stat(self, force=False):
+        """@@STAT queue every STAT_QUEUE_EVERY_S (and at a change of state)."""
+        if not EVENTS or not self.targets:
+            return
+        now = self.w.clock()
+        if self.last_queue is not None and now - self.last_queue < (STAT_QUEUE_EVERY_S / 2 if force else STAT_QUEUE_EVERY_S):
+            return                                     # at most 2 a second, state changes included
+        self.last_queue = now
+        tracks = self.w.tracks
+        jobs = list(self.queue) + ([self.current] if self.current is not None else [])
+        oldest = max((self.behind(j) for j in jobs), default=None)
+        window = min(60.0, max(1.0, now - self.started_at)) if self.started_at is not None else 60.0
+        behind_s = []
+        for t in tracks:
+            pending = getattr(t, "pending", None) or []
+            behind_s.append(max(0.0, (getattr(t, "fed", 0) - pending[0][1]) / RATE) if pending and isinstance(pending[0], tuple) else 0.0)
+        stat("queue", state=self.state, jobs=len(jobs), oldest_s=oldest, duty=self.duty(now) / window,
+             translated=self.translated, skipped=self.skipped, pending=[len(getattr(t, "pending", None) or []) for t in tracks],
+             behind_s=behind_s)
+
+    def halt(self):
+        """The recording stopped (on the worker's thread): the job in progress is closed and every queued one is left to
+        the final pass; a loaded model is handed to this process's final pass (record without --no-transcribe), a
+        half-loaded one let go."""
+        if self.stopped:
+            return
+        self.stopped = True
+        jobs = ([self.current] if self.current is not None else []) + self.queue
+        if jobs:
+            self._drop(jobs, "stop")
+        self.flush_records()
+        if self.loader is not None:
+            try:
+                self.loader.close()
+            except Exception:
+                pass
+            self.loader = None
+        if self.ready and self.model is not None:
+            _LIVE_MODEL[(TRANSLATOR, llm_repo())] = (self.model, self.tok)   # the slot stays held with it
+        elif self.use_llm:
+            if self.model is not None:
+                self.model = None
+                _mlx_clear_cache()
+            _SLOT.free()
+        _WANT.free()
+        self.model = self.tok = None
+        if self.executor is not None:
+            self.executor.shutdown(wait=False)
+        if self.targets:
+            self.set_state("stopped")
+
+
+class _DaemonHelper:
+    """One daemon thread that runs the submitted calls in order, each giving a concurrent.futures.Future. Unlike a
+    ThreadPoolExecutor's thread (joined when the interpreter exits), a call still running after the stop (a Claude
+    request on a stalled network, a CPU NLLB batch) does not keep the process from ending: its result is not wanted."""
+
+    def __init__(self, name):
+        import queue
+        self.calls = queue.SimpleQueue()
+        self.thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            item = self.calls.get()
+            if item is None:
+                return
+            future, fn, args = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn(*args))
+            except BaseException as e:
+                future.set_exception(e)
+
+    def submit(self, fn, *args):
+        from concurrent.futures import Future
+        future = Future()
+        self.calls.put((future, fn, args))
+        return future
+
+    def shutdown(self, wait=False):
+        self.calls.put(None)
+        if wait:
+            self.thread.join()
+
+
+def hf_partial_bytes(repos):
+    """The bytes of the downloads in progress (blobs/*.incomplete) of these repos in the Hugging Face cache, or None."""
+    try:
+        from huggingface_hub import constants
+        cache = Path(constants.HF_HUB_CACHE)
+    except Exception:
+        cache = Path(os.environ.get("HF_HUB_CACHE") or Path.home() / ".cache" / "huggingface" / "hub")
+    total, found = 0, False
+    for repo in repos:
+        if HY == HY_DEFAULT and repo == HY_DEFAULT:
+            names = {r for r, *_ in HY_FILES}
+        else:
+            names = {repo}
+        for name in names:
+            for blob in (cache / f"models--{name.replace('/', '--')}" / "blobs").glob("*.incomplete"):
+                try:
+                    total += blob.stat().st_size
+                    found = True
+                except OSError:
+                    pass
+    return total if found else None
+
+
+def offline_llm(targets, offline):
+    """Whether the offline translation of `targets` goes to TranslateGemma or Hy-MT3 (a target among its languages)."""
+    return bool(offline and targets and llm_on() and any(llm_code(t) for t in targets))
 
 
 def looks_mixed(probs):
@@ -2881,13 +3983,44 @@ def segment_lines(segs, a, lang, conf, guess, speaker):
     return new
 
 
-def decode_chunk(engine, chunk, a, allowed, forced, speaker, adaptive=False, context="media"):
+def _main_language(lines):
+    """The language most of these lines are in (for @@STAT chunk), or None."""
+    counts = collections.Counter(l.get("lang") for l in lines if l.get("lang"))
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def _add_signals(stats, lines):
+    """What the engine reported of each decode (_lp, _temp, _cr), gathered for @@STAT chunk before screen_made_up removes
+    it from the lines; nothing of it stays on a line."""
+    if stats is None:
+        return
+    for line in lines:
+        for key in ("_lp", "_temp", "_cr"):
+            if line.get(key) is not None:
+                stats.setdefault(key, []).append(float(line[key]))
+
+
+def _finish_signals(stats):
+    if stats is None:
+        return
+    lp, temp, cr = stats.pop("_lp", None), stats.pop("_temp", None), stats.pop("_cr", None)
+    if lp:
+        stats["lp"] = sum(lp) / len(lp)
+    if temp:
+        stats["temp"] = max(temp)
+    if cr:
+        stats["cr"] = max(cr)
+
+
+def decode_chunk(engine, chunk, a, allowed, forced, speaker, adaptive=False, context="media", stats=None):
     """The lines of one chunk starting at sample a: language decision, decoding, notes for a chunk without a result.
     adaptive: when the chunk's language probabilities look mixed (looks_mixed), it is re-cut at the finest settings
     (pauses of 200 ms, pieces of at least 1 s) and, when that gives two or more pieces, each piece gets its own language
     decision and decoding, so a switch inside the chunk gets its own tag; with one piece the chunk is decoded as it is.
     The re-cut is a VAD pass over at most 30 s (well under a second); each piece is one more Whisper pass.
-    context: "recording" (a recording or a call) or "media" (an imported file), for screen_made_up."""
+    context: "recording" (a recording or a call) or "media" (an imported file), for screen_made_up. stats, when a dict,
+    gets the chunk's mean log-probability (lp), highest fallback temperature (temp) and compression ratio (cr) for the
+    telemetry; the lines are the same either way."""
     state = engine.analyse(chunk, detect=forced is None)
     if adaptive and not forced and looks_mixed(state.probs):
         spans = speech_spans(chunk, 0, GRANULARITY["finest"][1])
@@ -2897,13 +4030,19 @@ def decode_chunk(engine, chunk, a, allowed, forced, speaker, adaptive=False, con
             for ps, pe in pieces:
                 piece = engine.analyse(chunk[ps:pe], detect=True)
                 segs, lang, conf, guess = decode_unit(engine, piece, allowed, forced)
-                lines = screen_made_up(segment_lines(segs, a + ps, lang, conf, guess, speaker), (a + pe) / RATE, context)
+                lines = segment_lines(segs, a + ps, lang, conf, guess, speaker)
+                _add_signals(stats, lines)
+                lines = screen_made_up(lines, (a + pe) / RATE, context)
                 if not lines:                          # a piece that gave nothing is said, like a chunk that gave nothing
                     lines = [{"t": round((a + ps) / RATE, 1), "note": f"speech not recognised for {round((pe - ps) / RATE)} s"}]
                 new.extend(lines)
+            _finish_signals(stats)
             return new
     segs, lang, conf, guess = decode_unit(engine, state, allowed, forced)
-    new = screen_made_up(segment_lines(segs, a, lang, conf, guess, speaker), (a + len(chunk)) / RATE, context)
+    new = segment_lines(segs, a, lang, conf, guess, speaker)
+    _add_signals(stats, new)
+    _finish_signals(stats)
+    new = screen_made_up(new, (a + len(chunk)) / RATE, context)
     if not new:
         new.append({"t": round(a / RATE, 1), "note": f"speech not recognised for {round(len(chunk) / RATE)} s"})
     return new
@@ -3236,7 +4375,28 @@ def fetch_model(repo, size, stage=True):
 
     text = f"Fetching the translation model {repo} first (once, {size}), so that it is here when it is needed"
     ev("STAGE", text) if EVENTS and stage else print(text, file=sys.stderr)
-    snapshot_download(repo)
+    with_download_stage(text if stage else None, [repo], lambda: snapshot_download(repo))
+
+
+def _download_stage(done, text, repos):
+    while not done.wait(DOWNLOAD_STAGE_EVERY_S):
+        got = hf_partial_bytes(repos)
+        if got is not None:
+            ev("STAGE", f"{text}: {got / 2**30:.1f} GB so far")
+
+
+def with_download_stage(text, repos, fn):
+    """fn() (a download); for a job (EVENTS, a stage `text`) its STAGE is sent again every DOWNLOAD_STAGE_EVERY_S with the
+    bytes downloaded so far, as tqdm's bars did in the log before the app turned them off (HF_HUB_DISABLE_PROGRESS_BARS).
+    A live recording's translator reports its download as @@STAT model instead (LiveTranslator._download_progress)."""
+    if not (EVENTS and text):
+        return fn()
+    done = threading.Event()
+    threading.Thread(target=_download_stage, args=(done, text, repos), daemon=True).start()
+    try:
+        return fn()
+    finally:
+        done.set()
 
 
 def translation_models(targets, offline):
@@ -3362,11 +4522,15 @@ def get_gemma(keep_engine=False):
     keep_engine (a live translation: both stay loaded, about 8.5 GB together)."""
     if not keep_engine:
         release_engine()
+    take_llm_slot()                                  # one translation model of this size per Mac (LlmSlot)
     return _load_gemma()
 
 
 @functools.lru_cache(maxsize=1)
 def _load_gemma():
+    handed = _LIVE_MODEL.pop(("gemma", GEMMA), None)    # loaded by this process's live worker: not loaded twice
+    if handed:
+        return handed
     from huggingface_hub import snapshot_download
     from mlx_lm import load
 
@@ -3389,6 +4553,8 @@ def release_gemma():
     if clear:
         clear()
     gc.collect()
+    _mlx_clear_cache()
+    _SLOT.free()
 
 
 # ---------- Hy-MT3: the third offline translator (Apple silicon, through mlx-lm) ----------
@@ -3498,12 +4664,17 @@ def fetch_hy(stage=True, refetch=True):
     from huggingface_hub import hf_hub_download, try_to_load_from_cache
 
     cached = {name: try_to_load_from_cache(repo, name, revision=commit) for repo, commit, name, _, _ in HY_FILES}
+    text = None
     if not all(isinstance(path, str) for path in cached.values()):
         text = "Downloading the translation model Hy-MT3 7B (first time only, about 4.2 GB)"
         ev("STAGE", text) if EVENTS and stage else print(text, file=sys.stderr)
     paths = {}
     for repo, commit, name, size, sha256 in HY_FILES:
-        path = cached[name] if isinstance(cached[name], str) else hf_hub_download(repo, name, revision=commit)
+        if isinstance(cached[name], str):
+            path = cached[name]
+        else:
+            path = with_download_stage(text if stage else None, [repo],
+                                       lambda: hf_hub_download(repo, name, revision=commit))
         paths[name] = _check_hy_file(repo, commit, name, size, sha256, path, stage, refetch)
     return paths
 
@@ -3574,17 +4745,26 @@ def get_hy(keep_engine=False):
     live translation: both stay loaded, about 6 GB together, an estimate)."""
     if not keep_engine:
         release_engine()
+    take_llm_slot()                                  # one translation model of this size per Mac (LlmSlot)
     return _load_hy()
+
+
+_LIVE_MODEL = {}             # (translator, repo) -> (model, tokenizer) a live worker loaded: this process's final pass reuses it
+_HY_FILES_CHECKED = {}       # {file: path} of HY_FILES once checked in this process (the live prepare thread checks them)
 
 
 @functools.lru_cache(maxsize=1)
 def _load_hy():
+    handed = _LIVE_MODEL.pop(("hy", HY), None)       # loaded by this process's live worker: not loaded twice
+    if handed:
+        return handed
     if HY == HY_DEFAULT:
         from mlx_lm.utils import load_model, load_tokenizer
 
         # Downloaded (a stage of the job) only when a file is missing; a recording's live worker has fetched them already,
         # so there it is only the check, which says nothing unless the big file was never checked.
-        files = fetch_hy(stage=not hy_present())
+        files = dict(_HY_FILES_CHECKED) if {"model.safetensors", "tokenizer.json"} <= set(_HY_FILES_CHECKED) else \
+            fetch_hy(stage=not hy_present())
         model, config = load_model(Path(files["model.safetensors"]).parent)
         tok = load_tokenizer(Path(files["tokenizer.json"]).parent, eos_token_ids=config.get("eos_token_id"))
     else:
@@ -3602,13 +4782,17 @@ def _load_hy():
             raise RuntimeError(f"{HY}: its tokenizer_config.json needs transformers 5 ('TokenizersBackend'); put Tencent's "
                                "tokenizer_config.json (https://huggingface.co/tencent/Hy-MT3-7B/blob/main/tokenizer_config.json) "
                                "in its place, or unset MT_HY_MODEL") from e
-    # The answer ends with <|eos|>. Tencent's own config.json names only that one (a copy converted from it too), the
-    # generation config also <|extra_5|>: both stop the generation, the second when the vocabulary has it.
+    _hy_end_tokens(tok)
+    return model, tok
+
+
+def _hy_end_tokens(tok):
+    """The answer ends with <|eos|>. Tencent's own config.json names only that one (a copy converted from it too), the
+    generation config also <|extra_5|>: both stop the generation, the second when the vocabulary has it."""
     tok.add_eos_token("<|eos|>")
     extra = tok.convert_tokens_to_ids("<|extra_5|>")
     if isinstance(extra, int) and extra != getattr(tok, "unk_token_id", None):
         tok.add_eos_token("<|extra_5|>")
-    return model, tok
 
 
 def release_hy():
@@ -3617,36 +4801,157 @@ def release_hy():
     if clear:
         clear()
     gc.collect()
+    _mlx_clear_cache()
+    _SLOT.free()
 
 
-def hy_translate(items, tgt, keep_engine=False):
+def _warm(paths, stopped=lambda: False):
+    """Reads the weights once in 16 MB blocks and drops them (the GIL is released while reading), so that the worker's
+    slices find them in the page cache; returns their size in bytes."""
+    total = 0
+    block = bytearray(16 << 20)
+    for path in paths:
+        try:
+            with open(os.path.realpath(path), "rb", buffering=0) as f:
+                while not stopped():
+                    n = f.readinto(block)
+                    if not n:
+                        break
+                    total += n
+        except OSError:
+            pass
+    return total
+
+
+def llm_live_parts(stopped=lambda: False):
+    """The live prepare thread's part of loading TranslateGemma or Hy-MT3, with no MLX: the pinned Hy-MT3 files checked
+    (once per process; a mismatch is an error here, never a download: see _check_hy_file), the model's folder, its
+    tokenizer with its end tokens, and the page cache warmed with its weights. -> (path, tok, bytes)."""
+    if TRANSLATOR == "hy" and HY == HY_DEFAULT:
+        files = fetch_hy(stage=False, refetch=False)
+        _HY_FILES_CHECKED.update(files)
+        folder, tok_dir, weights = Path(files["model.safetensors"]).parent, Path(files["tokenizer.json"]).parent, [files["model.safetensors"]]
+    else:
+        repo = llm_repo()
+        folder = Path(repo).expanduser()
+        if not folder.is_dir():
+            from huggingface_hub import snapshot_download
+            folder = Path(snapshot_download(repo, local_files_only=True))
+        tok_dir, weights = folder, sorted(str(p) for p in folder.glob("*.safetensors"))
+    try:
+        config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        config = {}
+    from mlx_lm.utils import load_tokenizer       # imported on the worker's thread already (LiveTranslator.start)
+
+    try:
+        tok = load_tokenizer(tok_dir, eos_token_ids=config.get("eos_token_id"))
+    except ValueError as e:
+        if "TokenizersBackend" not in str(e):
+            raise
+        raise RuntimeError(f"{HY}: its tokenizer_config.json needs transformers 5 ('TokenizersBackend'); put Tencent's "
+                           "tokenizer_config.json (https://huggingface.co/tencent/Hy-MT3-7B/blob/main/tokenizer_config.json) "
+                           "in its place, or unset MT_HY_MODEL") from e
+    if TRANSLATOR == "hy":
+        _hy_end_tokens(tok)
+    else:
+        tok.add_eos_token("<end_of_turn>")           # as _load_gemma
+    return SimpleNamespace(path=folder, tok=tok, bytes=_warm(weights, stopped) or None)
+
+
+def llm_live_model(path):
+    """On the live worker's thread: the model with lazy weights (mlx-lm builds it, nothing is evaluated yet)."""
+    from mlx_lm.utils import load_model
+
+    model, _ = load_model(Path(path), lazy=True)
+    return model
+
+
+def eval_in_slices(model, slice_bytes=None):
+    """A generator: the model's weights evaluated in slices of at most slice_bytes (LOAD_SLICE_BYTES), one mx.eval each,
+    yielding (bytes done, bytes in all) after each. The same weights as load_model(lazy=False), which evaluates them all
+    in one go, so the live worker can decode a chunk between two slices."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    limit = slice_bytes or LOAD_SLICE_BYTES
+    arrays = [a for _, a in tree_flatten(model.parameters())]
+    total = sum(int(a.nbytes) for a in arrays)
+    group, size, done = [], 0, 0
+    for a in arrays:
+        if group and size + int(a.nbytes) > limit:
+            mx.eval(*group)
+            done += size
+            yield done, total
+            group, size = [], 0
+        group.append(a)
+        size += int(a.nbytes)
+    if group:
+        mx.eval(*group)
+        done += size
+        yield done, total
+
+
+def _collect(gen):
+    """The return value of a step generator, run to its end at once."""
+    while True:
+        try:
+            next(gen)
+        except StopIteration as done:
+            return done.value
+
+
+def hy_translate(items, tgt, keep_engine=False, stats=None):
     """(texts, cut): the texts of `items` ((source code, text) pairs, codes from hy_code) in `tgt`, one request per text
     (a long text in pieces of whole sentences), and how many of them had a piece that ran to its token limit (kept: it is
     the best there is). Greedy, with the card's repetition penalty (1.05 over the last 20 tokens) and not its sampling: the
     same line always gives the same text, live, at the end and in a rerun (in a 10-line test meant to provoke loops no
     setting looped, and sampling changed half the lines from run to run). mlx-lm's penalty window holds the last prompt
     token and the reply, not the source text, so a name or a number copied from it is not penalised."""
-    from mlx_lm import stream_generate
-    from mlx_lm.sample_utils import make_logits_processors
+    from mlx_lm import stream_generate  # noqa: F401  (missing mlx-lm fails here, before the model is loaded)
 
     model, tok = get_hy(keep_engine)
     _thread_stream()
-    decoding = dict(logits_processors=make_logits_processors(repetition_penalty=1.05, repetition_context_size=20))
+    decoding = _hy_decoding()
     out, cut = [], 0
     for src, text in items:
-        done, short = [], False
-        for p in _pieces(text, HY_PIECE):
-            ids = tok.apply_chat_template([{"role": "user", "content": hy_prompt(p, tgt)}], add_generation_prompt=True)
-            budget = hy_budget(len(tok.encode(p, add_special_tokens=False)), tgt)
-            reply, finish = "", None
-            for r in stream_generate(model, tok, prompt=ids, max_tokens=budget, **decoding):
-                reply += r.text
-                finish = r.finish_reason
-            short = short or finish == "length"
-            done.append(reply.split("<|eos|>")[0].strip() or p)
+        text_out, short = _collect(hy_steps(src, text, tgt, model, tok, stats, decoding))
         cut += short
-        out.append(("" if tgt in HY_NO_SPACES else " ").join(done))
+        out.append(text_out)
     return out, cut
+
+
+def _hy_decoding():
+    from mlx_lm.sample_utils import make_logits_processors
+
+    return dict(logits_processors=make_logits_processors(repetition_penalty=1.05, repetition_context_size=20))
+
+
+def hy_steps(src, text, tgt, model, tok, stats=None, decoding=None):
+    """hy_translate of one text as a generator that yields after each token, for the live worker, which decodes speech
+    between two tokens; it returns (text, cut). The same requests with the same arguments in the same order as the
+    one-shot path, which is this generator run to its end. stats, when a dict, gets in_tok, out_tok and finish."""
+    from mlx_lm import stream_generate
+
+    decoding = decoding if decoding is not None else _hy_decoding()
+    done, short = [], False
+    for p in _pieces(text, HY_PIECE):
+        ids = tok.apply_chat_template([{"role": "user", "content": hy_prompt(p, tgt)}], add_generation_prompt=True)
+        budget = hy_budget(len(tok.encode(p, add_special_tokens=False)), tgt)
+        if stats is not None:
+            stats["in_tok"] = stats.get("in_tok", 0) + len(ids)
+        reply, finish = "", None
+        for r in stream_generate(model, tok, prompt=ids, max_tokens=budget, **decoding):
+            reply += r.text
+            finish = r.finish_reason
+            if stats is not None:
+                stats["out_tok"] = stats.get("out_tok", 0) + 1
+            yield
+        short = short or finish == "length"
+        if stats is not None:
+            stats["finish"] = "length" if short else "stop"
+        done.append(reply.split("<|eos|>")[0].strip() or p)
+    return ("" if tgt in HY_NO_SPACES else " ").join(done), short
 
 
 def _pieces(text, limit):
@@ -3678,23 +4983,38 @@ def _pieces(text, limit):
 GEMMA_PIECE = 1500    # characters per request: the model takes 2K tokens of input; a longer text goes sentence by sentence
 
 
-def gemma_translate(items, tgt, keep_engine=False):
+def gemma_translate(items, tgt, keep_engine=False, stats=None):
     """The texts of `items` ((source code, text) pairs, codes from gemma_code) in `tgt`, one request per text (a long
     text in pieces of whole sentences)."""
-    from mlx_lm import generate
+    from mlx_lm import stream_generate  # noqa: F401  (missing mlx-lm fails here, before the model is loaded)
 
     model, tok = get_gemma(keep_engine)
     _thread_stream()
-    out = []
-    for src, text in items:
-        done = []
-        for p in _pieces(text, GEMMA_PIECE):
-            msgs = [{"role": "user", "content": [{"type": "text", "source_lang_code": src, "target_lang_code": tgt, "text": p}]}]
-            ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
-            reply = generate(model, tok, prompt=ids, max_tokens=min(2048, 2 * len(ids) + 64))
-            done.append(reply.split("<end_of_turn>")[0].strip() or p)
-        out.append(("" if tgt.split("-")[0] in ("zh", "ja", "th") else " ").join(done))
-    return out
+    return [_collect(gemma_steps(src, text, tgt, model, tok, stats)) for src, text in items]
+
+
+def gemma_steps(src, text, tgt, model, tok, stats=None):
+    """gemma_translate of one text as a generator that yields after each token (see hy_steps); it returns the text.
+    stream_generate's pieces joined are what mlx-lm 0.29.1's generate() returns (its body is that concatenation)."""
+    from mlx_lm import stream_generate
+
+    done = []
+    for p in _pieces(text, GEMMA_PIECE):
+        msgs = [{"role": "user", "content": [{"type": "text", "source_lang_code": src, "target_lang_code": tgt, "text": p}]}]
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
+        if stats is not None:
+            stats["in_tok"] = stats.get("in_tok", 0) + len(ids)
+        reply, finish = "", None
+        for r in stream_generate(model, tok, prompt=ids, max_tokens=min(2048, 2 * len(ids) + 64)):
+            reply += r.text
+            finish = getattr(r, "finish_reason", None)
+            if stats is not None:
+                stats["out_tok"] = stats.get("out_tok", 0) + 1
+            yield
+        if stats is not None:
+            stats["finish"] = "length" if finish == "length" else "stop"
+        done.append(reply.split("<end_of_turn>")[0].strip() or p)
+    return ("" if tgt.split("-")[0] in ("zh", "ja", "th") else " ").join(done)
 
 
 def gemma_pair(lang, target, source=None):
@@ -3764,11 +5084,11 @@ def release_llm():
     release_hy() if TRANSLATOR == "hy" else release_gemma()
 
 
-def llm_translate(items, tgt, keep_engine=False):
+def llm_translate(items, tgt, keep_engine=False, stats=None):
     """(texts, cut) as hy_translate, with the chosen model (TranslateGemma's replies are never counted as cut)."""
     if TRANSLATOR == "hy":
-        return hy_translate(items, tgt, keep_engine)
-    return gemma_translate(items, tgt, keep_engine), 0
+        return hy_translate(items, tgt, keep_engine, stats)
+    return gemma_translate(items, tgt, keep_engine, stats), 0
 
 
 def line_translator(lang, target, offline, source=None):
@@ -4034,15 +5354,36 @@ def translate_llm_doc(doc, target, source=None, checkpoint=None, live=None):
         release_engine()                              # once: the speech model is not needed any more
     handle = open(log, "a", encoding="utf-8") if log and todo else None
     cut = 0                                           # lines with a piece that ran to the token limit (Hy-MT3)
+    sampler, yielded = SysSampler(), False
     try:
         for k, (i, src) in enumerate(todo, 1):
             if EVENTS:
                 ev("PROG", k, len(todo))
-            texts, n = llm_translate([(src, lines[i]["text"])], tgt, keep_engine=True)
+            if k > 1 and live_waiting():              # a live recording waits for the one translation model: hand it over
+                release_llm()                         # the model let go, MLX's cache emptied, the slot given back
+                text = "Paused: the recording in progress translates live (one translation model at a time)"
+                ev("STAGE", text) if EVENTS else print(text, file=sys.stderr)
+                while live_waiting():                 # until the recording has the slot (it stops wanting it then)
+                    time.sleep(0.5)
+                _SLOT.take()                          # back when the recording ends; the lines so far are in the log
+                text = f"Translating to {target}"
+                ev("STAGE", text) if EVENTS else print(text, file=sys.stderr)
+            stats, t0 = {}, time.monotonic()
+            texts, n = llm_translate([(src, lines[i]["text"])], tgt, keep_engine=True, stats=stats)
+            took = time.monotonic() - t0
             done[i], cut = texts[0], cut + n
             if handle:
                 handle.write(json.dumps({"i": i, "text": done[i]}, ensure_ascii=False) + "\n")
                 handle.flush()
+            if EVENTS:
+                stat("tr", src="final", track=0, t=lines[i].get("t"), target=target, model=TRANSLATOR, lines=1,
+                     ms=int(took * 1000), in_tok=stats.get("in_tok"), out_tok=stats.get("out_tok"),
+                     tps=stats["out_tok"] / took if stats.get("out_tok") and took > 0 else None, finish=stats.get("finish"),
+                     queue=len(todo) - k)
+                if sampler.due():
+                    sampler.send(**{"yield": yielded})
+            if gpu_yield(took):                       # a recording is live beside this job: half the GPU at most
+                yielded = True
     finally:
         if handle:
             handle.close()
@@ -4117,6 +5458,11 @@ def translate(doc, target, offline=False, source=None, checkpoint=None):
 def nllb_translate(items, tgt, translator, tok):
     """The texts of `items` ((source code, text) pairs) in `tgt`, with the local model: sentence by sentence, long
     sentences in pieces (as translate_offline cuts them), in batches of 16."""
+    return _collect(nllb_steps(items, tgt, translator, tok))
+
+
+def nllb_steps(items, tgt, translator, tok):
+    """nllb_translate as a generator that yields after each batch of 16 (the live worker's unit on a CPU engine)."""
     jobs, shape = [], {}                             # (item, sentence, piece, source, text); (item, sentence) -> pieces
     for k, (src, text) in enumerate(items):
         for n, sentence in enumerate(sentences(text)):
@@ -4134,6 +5480,7 @@ def nllb_translate(items, tgt, translator, tok):
             hyp = r.hypotheses[0][1:]                                      # [1:] drops the target-language token
             ids = [tok.token_to_id(t) for t in hyp]
             results[(k, n, p)] = tidy(tok.decode([x for x in ids if x is not None], skip_special_tokens=True).strip(), tgt) or piece
+        yield
     joiner = "" if tgt in NO_SPACES else " "
     out = []
     for k, (src, text) in enumerate(items):
@@ -4144,13 +5491,20 @@ def nllb_translate(items, tgt, translator, tok):
 
 def _nllb_texts(lines, target, source=None):
     """translate_texts with NLLB: a line already in the target stays as it is, one of a language NLLB lacks gets None."""
+    return _collect(_nllb_text_steps(lines, target, source))
+
+
+def _nllb_text_steps(lines, target, source=None, model=None):
+    """_nllb_texts as a generator that yields after each batch; `model` is NLLB's (translator, tokenizer) when it is
+    loaded already (the live worker's), else it is loaded here."""
     tgt = nllb_code(target)
     sources = [nllb_code(l.get("lang") or source) for l in lines]
     todo = [(i, src) for i, src in enumerate(sources) if src and src != tgt]
     out = [l["text"] if src == tgt else None for l, src in zip(lines, sources)]
     if todo:
-        translator, tok = get_nllb(keep_engine=True)
-        for (i, _), text in zip(todo, nllb_translate([(src, lines[i]["text"]) for i, src in todo], tgt, translator, tok)):
+        translator, tok = model or get_nllb(keep_engine=True)
+        texts = yield from nllb_steps([(src, lines[i]["text"]) for i, src in todo], tgt, translator, tok)
+        for (i, _), text in zip(todo, texts):
             out[i] = text
     return out
 
