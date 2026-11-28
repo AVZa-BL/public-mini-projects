@@ -24,7 +24,7 @@ This page describes **what the project does and what it does not do**. Command d
 | **Job** | record or import audio → full multilingual transcript (language per line) → translations on request. Nothing else. |
 | **Speech recognition** | Whisper `large-v3-turbo` (about 99 languages) through [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on the CPU; on Apple silicon, [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) on the GPU when installed |
 | **Who spoke** | optional: [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker diarization; optionally [pyannote.audio](https://github.com/pyannote/pyannote-audio) |
-| **Translation** | Claude (needs an API key and internet), or offline: NLLB-200 (about 90 languages) or, on Apple silicon, TranslateGemma 12B (51 languages) |
+| **Translation** | Claude (needs an API key and internet), or offline: NLLB-200 (about 90 languages) or, on Apple silicon, Hy-MT3 7B (102 languages; the app's default there) or TranslateGemma 12B (51 languages) |
 | **Input** | any audio/video format ffmpeg reads (mp3, m4a, wav, flac, ogg, opus, aac, wma, aiff, mp4, mov, m4v, mkv, webm, avi …); the microphone; the computer's own sound |
 | **Output** | `<name>.transcript.txt`, `<name>.<Language>.txt` per translation, and the recording (`<name>.wav`, or `<name>.mic.wav` + `<name>.system.wav` for a call) |
 | **Longest recording** | 4 hours by default, up to 8, counted in recorded audio (not wall-clock) |
@@ -88,12 +88,13 @@ The Mac app is a window around the same `mt.py` (bundled inside it), so both pro
 ### 3.6 Translation
 - **Any number of target languages** per run (`--to English --to Russian`); each becomes its own file, written as soon as it is ready, so a failure in the third language never hides the first two.
 - **Per-line source language:** each line is translated from the language it is tagged with, so mixed-language transcripts work; lines already in the target language are left alone. Labels (`<Them>`) and notes are kept.
-- **Three translators:**
+- **Four translators:**
 
 | Translator | Needs | Languages | Quality / notes |
 |---|---|---|---|
 | **Claude** (default for the command line) | `ANTHROPIC_API_KEY`, internet; text is sent to the Claude API | any Claude handles | the project's reference quality |
 | **NLLB-200** (`--offline`) | a 1.4 GB model, once; then no internet | about 90 common languages (by name or code) | below Claude's; literal at times; **non-commercial licence** |
+| **Hy-MT3 7B** (`--offline --translator hy`, the app's default on Apple silicon) | Apple silicon, `mlx-lm`, a 4.2 GB download, about 6 GB beside the speech model (estimate) | 102 (in this app 92 of 101 targets); other lines fall back to NLLB | vendor figures only, no independent evaluation yet; Apache-2.0, commercial use allowed |
 | **TranslateGemma 12B** (`--offline --translator gemma`) | Apple silicon, `mlx-lm`, 16 GB memory advised, a 7 GB download | 51 languages; other lines fall back to NLLB | better than NLLB on the project's 5-sentence spot check (a spot check, not a benchmark); commercial use allowed by its terms |
 
 - **Live translation, side by side** (`record --live --to Russian`, app: *Also translate to*): each line is translated as it appears. Since 1.11.0 the pane shows the text and one column per translation, with a picker for which columns to show; *Copy* puts them on the clipboard tab-separated for a spreadsheet.
@@ -161,8 +162,8 @@ The language is decided **once per chunk of speech**, so how speech is cut decid
 - **Mac app:** macOS 13 or newer. The Apple-GPU engine and the call-sound process tap need newer systems (GPU parts: Apple silicon, macOS 14+, Python 3.10+; process tap: macOS 14.2+).
 - **Command line (macOS, Linux):** Python 3.9 or newer (CI tests 3.9 and 3.12); `pip install -r requirements.txt` (includes `static-ffmpeg`, which fetches ffmpeg when the system has none). Recording needs `libportaudio2` on Linux.
 - **Command line (Windows, since 1.11.0):** Windows 10 or 11 on x64, PowerShell, Python 3.12 and the Visual C++ runtime (the README installs both with `winget`); an NVIDIA GPU is optional. Windows on Arm works only through x64 Python under emulation and was not measured.
-- **Disk:** about 2 GB for the speech engine at setup; about 3 GB of model cache including the offline translator (1.4 GB); TranslateGemma adds 7 GB; pyannote about 2 GB.
-- **Memory:** the speech model about 1.6 GB; a 3-hour recording is about 350 MB of 16 kHz WAV (115 MB per hour per track); transcribing holds audio as float32 (about 230 MB per hour). A Mac with 8 GB can do a 4-hour file if other large programs are closed. A live recording with offline translation holds both models (about 3 GB); TranslateGemma about 7 GB (8.5 GB beside the speech model).
+- **Disk:** about 2 GB for the speech engine at setup; about 3 GB of model cache including the offline translator (1.4 GB); Hy-MT3 adds 4.2 GB, TranslateGemma 7 GB; pyannote about 2 GB.
+- **Memory:** the speech model about 1.6 GB; a 3-hour recording is about 350 MB of 16 kHz WAV (115 MB per hour per track); transcribing holds audio as float32 (about 230 MB per hour). A Mac with 8 GB can do a 4-hour file if other large programs are closed. A live recording with offline translation holds both models (about 3 GB); Hy-MT3 about 4.5 GB (about 6 GB beside the speech model; estimates, not measured); TranslateGemma about 7 GB (8.5 GB beside the speech model).
 - **Time:** about 5 s per chunk on the measured CPU whatever its length, because Whisper pads each chunk to 30 s, so time grows with the number of chunks. An Apple-silicon GPU is expected to be several times faster (**not measured**).
 
 ## 7. Limitations
@@ -190,9 +191,10 @@ The language is decided **once per chunk of speech**, so how speech is cut decid
 
 ### Translation
 - **Offline translation is below Claude's quality.** NLLB works one sentence at a time, can be literal ("Guten Tag zusammen" became "Have a good day together" in a test), writes Chinese with ASCII punctuation, and a wrong language tag gives a wrong translation. Names, numbers and idioms deserve a check.
-- **NLLB's weights are non-commercial (CC-BY-NC 4.0), and Meta calls NLLB-200 a research model**, not meant for certified translation. Use Claude or another model for commercial or legally binding work. TranslateGemma's terms allow commercial use.
+- **NLLB's weights are non-commercial (CC-BY-NC 4.0), and Meta calls NLLB-200 a research model**, not meant for certified translation. Use Claude or another model for commercial or legally binding work. Hy-MT3's licence (Apache-2.0) and TranslateGemma's terms allow commercial use.
 - **Translation with Claude sends the transcript text to the Claude API** and costs API usage.
 - **TranslateGemma** is limited to 51 languages, to Apple silicon, and to machines with about 16 GB of memory; a whole 3-hour meeting takes about an hour per language at the end (estimated, **not measured**), less with live translation.
+- **Hy-MT3**'s quality figures are Tencent's own (no independent evaluation yet, none per language pair for Russian or German); it runs on Apple silicon only, its memory and speed on a Mac are **not measured**, and its 4-bit weights are a third party's copy (NetProjects), pinned and checked by SHA-256.
 - **Offline translation speed:** about 0.4 s per two-sentence line on a 4-core CPU, roughly 15–25 minutes per language for a 3-hour meeting (measured on Linux x86, not on a Mac).
 
 ### Platform and scope
@@ -205,7 +207,7 @@ The language is decided **once per chunk of speech**, so how speech is cut decid
 
 ## 8. Licences and attributions
 
-- Speech model: OpenAI Whisper weights as published for `large-v3-turbo`, run through faster-whisper (SYSTRAN) or mlx-whisper. Diarization: sherpa-onnx with pyannote segmentation 3.0 and 3D-Speaker ERes2Net embeddings. Offline translation: NLLB-200 (Meta, CC-BY-NC 4.0) converted for CTranslate2 by OpenNMT; TranslateGemma (Google; Gemma Terms of Use). The ffmpeg binaries fetched by `static-ffmpeg` are GPL builds of [FFmpeg](https://ffmpeg.org).
+- Speech model: OpenAI Whisper weights as published for `large-v3-turbo`, run through faster-whisper (SYSTRAN) or mlx-whisper. Diarization: sherpa-onnx with pyannote segmentation 3.0 and 3D-Speaker ERes2Net embeddings. Offline translation: NLLB-200 (Meta, CC-BY-NC 4.0) converted for CTranslate2 by OpenNMT; Hy-MT3 7B (Tencent, Apache-2.0; the 4-bit MLX copy by NetProjects); TranslateGemma (Google; Gemma Terms of Use). The ffmpeg binaries fetched by `static-ffmpeg` are GPL builds of [FFmpeg](https://ffmpeg.org).
 - Each component keeps its own licence; check them before commercial use. **This repository's own licence is not yet stated**: until a LICENSE file is added, the default copyright rules apply.
 
 ## 9. Where to look next

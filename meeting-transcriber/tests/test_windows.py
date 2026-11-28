@@ -1492,6 +1492,7 @@ def gpu(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "ctranslate2", SimpleNamespace(get_cuda_device_count=count, Translator=FakeTranslator))
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisper))
     monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=lambda repo, **kw: str(tmp_path)))
+    (tmp_path / "model.bin").write_bytes(b"")          # a complete NLLB snapshot (one without its weights is fetched again)
     monkeypatch.setitem(sys.modules, "tokenizers", SimpleNamespace(Tokenizer=SimpleNamespace(from_file=lambda p: "tok")))
     monkeypatch.delenv("MT_DEVICE", raising=False)
     FakeWhisper.made, FakeWhisper.fail, FakeWhisper.missing, FakeWhisper.decoded = [], set(), False, []

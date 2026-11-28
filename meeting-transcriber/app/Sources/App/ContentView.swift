@@ -77,7 +77,9 @@ final class Prefs: ObservableObject {
         meName = d.string(forKey: "meName") ?? "You"
         themName = d.string(forKey: "themName") ?? "Them"
         offline = d.object(forKey: "offline") == nil ? true : d.bool(forKey: "offline")     // offline unless chosen otherwise
-        translator = OfflineTranslator(rawValue: d.string(forKey: "translator") ?? "") ?? .nllb
+        // Hy-MT3 on Apple silicon for a user who never picked a model; a stored choice is kept. The key is written only by
+        // the picker (didSet does not run for this assignment in init), so this default is not stored as a choice.
+        translator = OfflineTranslator.initial(stored: d.string(forKey: "translator"), appleSilicon: Runner.machine == "arm64")
         let hours = d.integer(forKey: "recordHours")
         recordHours = (1...8).contains(hours) ? hours : 4
         transcribeLater = d.bool(forKey: "transcribeLater")
@@ -190,7 +192,7 @@ final class Prefs: ObservableObject {
         s.recordHours = recordHours
         s.transcribeLater = transcribeLater
         s.live = live
-        s.translator = Runner.machine == "arm64" ? translator : .nllb      // TranslateGemma runs on the Apple GPU only
+        s.translator = Runner.machine == "arm64" ? translator : .nllb      // Hy-MT3 and TranslateGemma run on the Apple GPU only
         s.plainLanguage = plainLanguage
         s.speakers = speakers
         s.speakerCount = speakerCount
@@ -545,7 +547,7 @@ struct ContentView: View {
                         .disabled(Runner.machine != "arm64")
                     }
                     Text((Runner.machine == "arm64" ? prefs.translator : .nllb).hint
-                         + (Runner.machine == "arm64" ? "" : " TranslateGemma needs Apple silicon.")
+                         + (Runner.machine == "arm64" ? "" : " Hy-MT3 and TranslateGemma need Apple silicon.")
                          + " After the download no internet is needed.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

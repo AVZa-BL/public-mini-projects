@@ -11,6 +11,7 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from datetime import datetime
@@ -63,7 +64,11 @@ CLAUDE = os.environ.get("MT_CLAUDE_MODEL", "claude-sonnet-5-5")
 NLLB = os.environ.get("MT_NLLB_MODEL", "OpenNMT/nllb-200-distilled-1.3B-ct2-int8")
 # The second offline translator, TranslateGemma 12B on the Apple GPU (see gemma_code); --translator gemma chooses it.
 GEMMA = os.environ.get("MT_GEMMA_MODEL", "mlx-community/translategemma-12b-it-4bit")
-TRANSLATOR = os.environ.get("MT_TRANSLATOR", "nllb")     # the offline translator: nllb or gemma
+# The third, Hy-MT3 7B on the Apple GPU (see hy_code); --translator hy chooses it. Unset, MT_HY_MODEL means the pinned and
+# checked files of HY_FILES; set, a Hugging Face repo id or a local folder, loaded as it is.
+HY_DEFAULT = "netprojects/Hy-MT3-7B-MLX-4bit"
+HY = os.environ.get("MT_HY_MODEL") or HY_DEFAULT
+TRANSLATOR = os.environ.get("MT_TRANSLATOR", "nllb")     # the offline translator: nllb, gemma or hy
 EVENTS = os.environ.get("MT_EVENTS") == "1"   # the Mac app sets this: machine-readable "@@KIND<TAB>fields" lines on stdout
 # The output folder (the app's "Output" box): without --out, every result goes to a subfolder of it named after the hour
 # the meeting began (`26-11-22 14`: yy-mm-dd hh), the transcript, the translations and the recording's audio together.
@@ -77,6 +82,15 @@ NOTICE_S = 600        # a notice this long before a recording stops at its limit
 EXTEND_S = 3600       # what one SIGUSR1 (the app's "Extend") adds to a running recording
 
 
+# One event line at a time on stdout: the live worker's thread and the main thread both send events, and print() writes
+# a line and its newline separately, so two of them at once could glue ('@@CLEAR@@LEVEL\t0.25', which the app reads as
+# text and loses the CLEAR). ev() writes the whole line in one write(), which is what fixes that on CPython's own stdout;
+# the lock keeps a line whole on a stdout that writes in pieces too (a wrapper, a free-threaded build), as the test
+# test_events_of_two_threads_never_glue_into_one_line checks. Reentrant: a signal handler runs on the main thread,
+# possibly while it is inside ev().
+EV_LOCK = threading.RLock()
+
+
 def ev(kind, *fields):
     if kind == "DONE":
         # The work is done: from here on an end of stdin (a front end that closes the pipe on @@DONE) or a late stop or
@@ -84,7 +98,10 @@ def ev(kind, *fields):
         # before the line is printed, so that a close answering it cannot come first and end the process as SIGTERM.
         CONTROL.listen({verb: (lambda: None) for verb in (*CONTROL_VERBS, "eof")})
     clean = [re.sub(r"[\t\r\n]", " ", str(f)) for f in fields]   # only these split a line; other spaces (U+202F ...) are kept
-    print("@@" + "\t".join([kind, *clean]), flush=True)
+    line = "@@" + "\t".join([kind, *clean]) + "\n"
+    with EV_LOCK:                                      # the whole line in one write, then flushed (see EV_LOCK)
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def note(text):
@@ -1218,9 +1235,21 @@ def ensure_ffmpeg():
     return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
+def _decode_signals(temperature, compression_ratio):
+    """The temperature the decode ended at and its compression ratio, when the engine reports them (screen_made_up reads
+    them: a decode that still fails Whisper's thresholds at a temperature above 0 is one Whisper itself rejected)."""
+    out = {}
+    if temperature is not None:
+        out["temp"] = float(temperature)
+    if compression_ratio is not None:
+        out["cr"] = float(compression_ratio)
+    return out
+
+
 def _segment(s):
     return {"start": float(s.start), "end": float(getattr(s, "end", s.start)), "text": s.text,
-            "logprob": float(getattr(s, "avg_logprob", 0.0) or 0.0)}
+            "logprob": float(getattr(s, "avg_logprob", 0.0) or 0.0),
+            **_decode_signals(getattr(s, "temperature", None), getattr(s, "compression_ratio", None))}
 
 
 class CT2Engine:
@@ -1362,7 +1391,8 @@ class MLXEngine:
         result = self.lib.transcribe(state.chunk, path_or_hf_repo=self.repo, language=language,
                                      condition_on_previous_text=False, verbose=None)
         return [{"start": float(s["start"]), "end": float(s["end"]), "text": s["text"],
-                 "logprob": float(s.get("avg_logprob", 0.0) or 0.0)} for s in result.get("segments", [])]
+                 "logprob": float(s.get("avg_logprob", 0.0) or 0.0),
+                 **_decode_signals(s.get("temperature"), s.get("compression_ratio"))} for s in result.get("segments", [])]
 
 
 @functools.lru_cache(maxsize=None)
@@ -1502,6 +1532,7 @@ class Checkpoint:
         self.meta = Path(folder) / f"partial{tag}.json"
         self.log = Path(folder) / f"partial{tag}.jsonl"
         self.handle = None
+        self.was_live = False                          # resume() found a live checkpoint (reused or not)
 
     @staticmethod
     def _same(a, b, live):
@@ -1514,6 +1545,7 @@ class Checkpoint:
         `covered` is how many samples a live run had cut into chunks; the rest of the audio is still to be cut."""
         try:
             meta = json.loads(self.meta.read_text(encoding="utf-8"))
+            self.was_live = bool(meta.get("live"))
             if not self._same(meta.get("fingerprint"), fingerprint, meta.get("live")):
                 earlier = meta.get("fingerprint") or {}
                 changed = sorted(k for k in set(earlier) | set(fingerprint or {}) if earlier.get(k) != (fingerprint or {}).get(k)
@@ -1812,11 +1844,12 @@ def with_notes(lines, notes):
 
 
 def transcribe_lines(src, language=None, track=None, granularity="auto", speaker=None, position=None, checkpoint=None,
-                     speakers=None, diarizer="sherpa", label="Speaker"):
+                     speakers=None, diarizer="sherpa", label="Speaker", context="media"):
     """The lines of one audio file (speaker, when given, is put on every line). granularity: auto or a key of GRANULARITY, how finely speech is cut into chunks. language: None = Whisper detects each chunk among all its languages; one language = forced for the whole file;
     several (a list or 'ru,en,de') = detected per chunk, but only among these (a language Whisper is sure of still wins, tagged as a guess).
     position: (track, tracks) of a call, for the progress. A chunk in which nothing was recognised becomes a note line, so the
-    transcript shows where speech was lost; a note at the end says how much."""
+    transcript shows where speech was lost; a note at the end says how much. context: "recording" (a recording or a
+    call) or "media" (an imported file), for screen_made_up."""
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
     allowed = parse_languages(language) if isinstance(language, str) or language is None else list(language)
@@ -1830,6 +1863,9 @@ def transcribe_lines(src, language=None, track=None, granularity="auto", speaker
     cp = Checkpoint(checkpoint, f".{position[0]}" if position else "") if checkpoint else None
     fp = fingerprint(src, allowed, resolved, speaker, engine_name(), track)    # the same source as a live track's
     chunks, done, covered = cp.resume(fp) if cp else (None, {}, 0)
+    # A live run whose chunks cannot be reused (its languages or granularity were changed): the window still shows its
+    # lines, which this run decodes again; it starts empty (a call's tracks are sent again after the merge).
+    restart_window = bool(cp and cp.was_live and chunks is None and EVENTS and position is None)
     segments = None
     if speakers is not None:
         if EVENTS:
@@ -1871,6 +1907,8 @@ def transcribe_lines(src, language=None, track=None, granularity="auto", speaker
     hidden = []                                        # the made-up lines left out so far: they count toward a repeated outro
     speed_key = f"{engine.name}:{model_identity(engine.name)}"
     chunk_times, last_tick = [], time.monotonic()
+    if restart_window:
+        ev("CLEAR")
     if EVENTS and len(chunks) > len(done):
         remembered = load_speed(speed_key)         # how long a chunk took last time: an estimate before the first one is done
         if remembered is not None:
@@ -1881,7 +1919,8 @@ def transcribe_lines(src, language=None, track=None, granularity="auto", speaker
             new = done[i]
         else:
             try:
-                new = decode_chunk(engine, audio[a:b], a, allowed, forced, speaker, adaptive=resolved == "adaptive")
+                new = decode_chunk(engine, audio[a:b], a, allowed, forced, speaker, adaptive=resolved == "adaptive",
+                                   context=context)
             except Exception as e:                     # one bad chunk must not cost the hours already done
                 failed += 1
                 print(f"warning: chunk {i} at {hms(a / RATE)} failed: {type(e).__name__}: {e}", file=sys.stderr)
@@ -1891,7 +1930,7 @@ def transcribe_lines(src, language=None, track=None, granularity="auto", speaker
             decoded += 1
             chunk_times.append(time.monotonic() - last_tick)
         last_tick = time.monotonic()
-        screened = screen_made_up(new)                 # also the lines of a checkpoint written before the screening existed
+        screened = screen_made_up(new, context=context)   # also the lines of a checkpoint written before the screening existed
         new = without_made_up(screened)
         hidden.extend(l for l in screened if l.get("made_up"))
         made += len(screened) - len(new)
@@ -2016,6 +2055,11 @@ class LiveTrack:
         self.covered = 0                               # samples cut into chunks so far
         self.chunks = []                               # (a, b) handed out
         self.pending = []                              # chunks waiting for the worker
+        self.shown = []                                # the lines shown in the window so far (LiveWorker.resend)
+        self.outro_count = collections.Counter()       # outros decoded so far, and the shown copies (mark_repeated_outros)
+        self.shown_outros = collections.defaultdict(list)
+        self.outro_chunks = {}                         # chunk index -> (its lines, how many were marked) while a shown outro is in it
+        self.withdrawn = False                         # a shown line was marked made up since the window was last sent
         self.cp = Checkpoint(folder, tag)
         # The final pass fingerprints without a speaker (a call's labels come from the merge), so the live one does too.
         self.fp = dict(fingerprint(src, allowed, resolve_granularity(granularity, allowed), None, engine_name), size=None, mtime=None)
@@ -2085,10 +2129,16 @@ class LiveTrack:
         i = self.chunks.index((a, b)) + 1
         try:
             lines = decode_chunk(engine, self.audio[a - self.base:b - self.base], a, self.allowed, self.forced, self.speaker,
-                                 adaptive=self.granularity == "adaptive")
+                                 adaptive=self.granularity == "adaptive", context="recording")
         except Exception as e:
             lines = [{"t": round(a / RATE, 1), "note": f"chunk failed ({type(e).__name__}: {e})"}]
+        if mark_repeated_outros(self, lines):          # an outro come again and again: its shown copies are withdrawn too
+            self.withdrawn = True
+            self._record_withdrawn()
         shown = without_made_up(lines)                 # what Whisper made up on noise: kept for the final count, never shown
+        if any(is_outro(l) for l in shown):            # a copy that may be withdrawn later: its chunk is written again then
+            vars(self).setdefault("outro_chunks", {})[i] = (lines, sum(1 for l in lines if l.get("made_up")))
+        vars(self).setdefault("shown", []).extend(shown)
         if EVENTS:
             for line in shown:
                 ev("LINE", json.dumps(dict(line, live=True), ensure_ascii=False))
@@ -2102,6 +2152,20 @@ class LiveTrack:
         if EVENTS:
             ev("POS", round(self.covered / RATE, 1), round(self.fed / RATE, 1))
         return shown
+
+    def _record_withdrawn(self):
+        """Writes the earlier chunks whose shown outro was just withdrawn to the checkpoint again, with the mark: resume
+        keeps the last record of a chunk, so the final pass neither shows nor sends them again, and its note still
+        counts each copy once. A chunk is forgotten here once it holds no unmarked outro. The chunk being decoded is
+        not among them yet (decode adds it after this call, and writes it at its end)."""
+        chunks = vars(self).setdefault("outro_chunks", {})
+        for j, (lines, marked) in list(chunks.items()):
+            now = sum(1 for l in lines if l.get("made_up"))
+            if now > marked:
+                self.cp.record(j, lines)
+                chunks[j] = (lines, now)
+            if not any(is_outro(l) and not l.get("made_up") for l in lines):
+                del chunks[j]
 
     def close(self):
         self.cp.finish_log_only()
@@ -2130,16 +2194,16 @@ class LiveWorker:
         self.thread.start()
 
     def fetch_models(self):
-        """On a thread of its own: the translation models downloaded if they are not here yet (7 GB for TranslateGemma
-        the first time), so that neither the recording nor the live transcript waits for them. A chunk decoded meanwhile
-        gets no live translation; the final pass translates it."""
+        """On a thread of its own: the translation models downloaded if they are not here yet (7 GB for TranslateGemma,
+        4.2 GB for Hy-MT3 the first time), so that neither the recording nor the live transcript waits for them. A chunk
+        decoded meanwhile gets no live translation; the final pass translates it."""
         try:
             for repo, size in translation_models(self.targets, self.offline):
                 try:
                     fetch_model(repo, size, stage=False)
                 except Exception as e:
-                    if repo == NLLB and TRANSLATOR == "gemma":     # TranslateGemma's lines go on; NLLB's wait for the end
-                        print(f"NLLB could not be fetched ({type(e).__name__}); the lines TranslateGemma does not cover "
+                    if repo == NLLB and llm_on():      # TranslateGemma's or Hy-MT3's lines go on; NLLB's wait for the end
+                        print(f"NLLB could not be fetched ({type(e).__name__}); the lines {llm_label()} does not cover "
                               "are translated at the end", file=sys.stderr)
                         continue
                     raise
@@ -2152,9 +2216,11 @@ class LiveWorker:
 
     def load_models(self):
         """On the worker's own thread, between two chunks (the model's GPU work stays on one thread): the model that
-        takes most lines, TranslateGemma when a target is one of its languages, else NLLB."""
-        if TRANSLATOR == "gemma" and any(gemma_code(t) for t in self.targets):
-            get_gemma(keep_engine=True)
+        takes most lines, TranslateGemma or Hy-MT3 when a target is one of its languages, else NLLB."""
+        if llm_on() and any(llm_code(t) for t in self.targets):
+            if TRANSLATOR == "hy" and HY == HY_DEFAULT:
+                fetch_hy(stage=False, refetch=False)   # checked here first: a file to download again waits for the final pass
+            get_llm(keep_engine=True)
         else:
             get_nllb(keep_engine=True)
 
@@ -2206,6 +2272,8 @@ class LiveWorker:
                     if lines is not None:
                         worked = True
                         self.lines += sum(1 for l in lines if "text" in l)
+                    if any(getattr(t, "withdrawn", False) for t in self.tracks):
+                        self.resend()
                 if not worked:
                     if self.stop_flag.is_set():
                         for track in self.tracks:      # the recording is over: what is closed now is decoded too
@@ -2220,6 +2288,20 @@ class LiveWorker:
             if EVENTS:                                 # the window stops saying that the model is loading
                 ev("CHECK", "live", "failed")
             note(f"Live transcription stopped ({type(e).__name__}: {e}); the recording goes on and everything is transcribed at the end")
+
+    def resend(self):
+        """The window again without the lines withdrawn since they were shown (an outro said again and again): @@CLEAR,
+        then every track's shown lines that stand, by time, with their translations. One worker sends every @@LINE of a
+        recording, so one CLEAR covers both tracks of a call."""
+        kept = []
+        for track in self.tracks:
+            track.withdrawn = False
+            track.shown = [l for l in getattr(track, "shown", []) if not l.get("made_up")]
+            kept.extend(track.shown)
+        if EVENTS:
+            ev("CLEAR")
+            for line in in_time_order(kept):
+                ev("LINE", json.dumps(dict(line, live=True), ensure_ascii=False))
 
     def stop(self, wait=120):
         """Ends the worker and waits for it: its checkpoint is handed to the final pass only once nothing writes to it. A
@@ -2269,21 +2351,41 @@ def decode_unit(engine, state, allowed, forced):
 # community": openai/whisper discussions 928, 1873 and 2608; Barański et al. 2025, "Investigation of Whisper ASR
 # Hallucinations Induced by Non-Speech Audio"). Its own no-speech score does not catch them: such a line is decoded with
 # confidence, and large-v3-turbo reports a no-speech probability of about 0 even for silence (SYSTRAN/faster-whisper#1128).
-# MADE_UP_ALWAYS: text that is essentially never real speech (subtitle credits, Amara.org, named subtitle authors, sound
-# captions in capitals); MADE_UP_DOUBTFUL: outros a real video says too ("Thanks for watching", "Продолжение следует"),
-# made up only when a line of nothing else stands alone in its chunk, stretched over a long stretch of near-silence, or
-# when it comes 3 times or more on one track. Short thanks ("Thank you.", "Спасибо.") are never dropped. Every pattern
-# matches a whole sentence (^...$), never a part of a longer one. The lists were collected from the reports and from the
-# filters of other projects (Vexa, hex, Speech-Translate, BeniaBot) and checked against real sentences in the tests.
+# MADE_UP_ALWAYS (and MADE_UP_CAPTION): text that is essentially never real speech (subtitle credits, Amara.org, named
+# subtitle authors, sound captions); MADE_UP_MEDIA: the phrases of a published video ("Thanks for watching", channel
+# plugs, broadcaster tags, "Продолжение следует"): in a recording or a call they are dropped like a credit (and cut
+# off the end of a real line), in an imported file (which may be such a video) only with a sign that nobody said them;
+# MADE_UP_DOUBTFUL: outros and plugs people really say in meetings too ("Спасибо за внимание", "Subscribe to the
+# channel", "Captions by Friday"), dropped only with a sign that nobody said them; MADE_UP_MEETING: the same, but never
+# counted as repeated (goodbyes several people say: "Bis zum nächsten Mal", "See you tomorrow"); MADE_UP_SHORT: short thanks and goodbyes ("Thank you.", "Спасибо."), never
+# dropped by their text, only alone in their chunk and timed by Whisper past the end of the audio (made_up). The signs:
+# stretched over near-silence (_stretched), timed far past the end of the chunk's audio (OVERHANG_S), a decode that still
+# fails Whisper's own thresholds after its temperature fallback (_failed, for MADE_UP_MEDIA in an imported file only),
+# or 3 times or more on one track (MADE_UP_MEDIA and MADE_UP_DOUBTFUL). Every
+# pattern matches a whole sentence (^...$), never a part of a longer one. The lists were collected from the reports and
+# from the filters of other projects (Vexa, hex, Speech-Translate, BeniaBot, NeuroMita, Lapsus, Sharrnah, tapeback) and
+# checked against real sentences in the tests.
 MADE_UP_ALWAYS = [re.compile(p, re.I) for p in (
-    # Субтитры сделал/создавал/делал/добавил DimaTorzok; bare DimaTorzok; 'канал Субтитры сделал DimaTo...
-    r"^[\W_]*(?:канал\W+)?(?:субтитры\W+)?(?:\w+\W+)?dima\W?torzok[\W_]*$",
+    # Субтитры сделал/создавал/делал/добавил DimaTorzok; bare DimaTorzok; 'канал Субтитры сделал DimaTo...; repeated
+    # without a break; run into 'Продолжение следует' ('Субтитры сделал DimaTorzok, Продолжение следует...')
+    r"^[\W_]*(?:(?:канал\W+)?(?:субтитры\W+)?(?:\w+\W+)?dima\W?torzok[\W_]*)+(?:продолжение\W+следует[\W_]*)?$",
     # Субтитры подогнал «Симон»!
     r"^[\W_]*субтитры\W+подогнал\W+симон[\W_]*$",
-    # Редактор субтитров А.Синецкая/А.Семкин/М.Лосева/Е.Воинова Корректор А.Егорова/А.Кулакова; Редакто...
-    r"^[\W_]*(?:редактор|субтитры)\W+субтитров\W+(?-i:[А-ЯЁ])(?:\.\s?|\s)(?-i:[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)(?:\W+корректор\W+(?-i:[А-ЯЁ])(?:\.\s?|\s)(?-i:[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?))?[\W_]*$",
-    # Корректор А.Егорова / Корректор А.Кулакова as a separate segment (the tail of the editor credit)
-    r"^[\W_]*корректор\W+(?-i:[А-ЯЁ])(?:\.\s?|\s)(?:егорова|кулакова)[\W_]*$",
+    # Редактор субтитров А.Синецкая/А.Семкин/М.Лосева/Е.Воинова Корректор А.Егорова/А.Кулакова; Редакто...; also run
+    # into 'Продолжение следует...' without a sentence break
+    r"^[\W_]*(?:редактор|субтитры)\W+субтитров\W+(?-i:[А-ЯЁ])(?:\.\s?|\s)(?-i:[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)(?:\W+корректор\W+(?-i:[А-ЯЁ])(?:\.\s?|\s)(?-i:[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?))?(?:\W+продолжение\W+следует)?[\W_]*$",
+    # Корректор А.Егорова / Корректор А.Кулакова as a separate segment (the tail of the editor credit); also glued
+    # without the initial, 'Корректор .Кулакова' (tapeback _quality.py): the dot right before the surname, never a
+    # plain 'Корректор Егорова' or 'Корректор. Егорова.' (a proofreader named in an editorial meeting)
+    r"^[\W_]*корректор(?:\W+(?-i:[А-ЯЁ])(?:\.\s?|\s)|\s?\.)(?:егорова|кулакова)[\W_]*$",
+    # Субтитры А.Синецкая (NeuroMita whisper_recognizer.py)
+    r"^[\W_]*субтитры\W+(?-i:[А-ЯЁ])\.\s?синецкая[\W_]*$",
+    # Субтитры и корректура Оксаны Каменской (NeuroMita)
+    r"^[\W_]*субтитры\W+и\W+корректура\W+оксаны\W+каменской[\W_]*$",
+    # www.northstarit.co.uk (openai/whisper discussion 928)
+    r"^[\W_]*(?:www\W+)?northstarit\W+co\W+uk[\W_]*$",
+    # This video is a derivative work of the Touhou Project (openai/whisper discussion 1873)
+    r"^[\W_]*this\W+video\W+is\W+a\W+derivative\W+work\W+of\W+the\W+touhou\W+project[\W_]*$",
     # Спасибо за субтитры Алексею Дубровскому!
     r"^[\W_]*спасибо\W+за\W+субтитры\W+алексею\W+дубровскому[\W_]*$",
     # Субтитрувальниця Оля Шор, also with 'Дякую за перегляд!' in front in the same segment
@@ -2296,8 +2398,10 @@ MADE_UP_ALWAYS = [re.compile(p, re.I) for p in (
     r"^[\W_]*(?:www\W+)?amara\W*org(?:\W+(?:community|communauté|gemeinschaft|gemeenschap|comunidade|comunidad|comunità|społeczność|közösség|сообщество))?[\W_]*$",
     # 由 Amara.org 社群提供的字幕
     r"^[\W_]*由\W*amara\W*org\W*社[群区區]提供的字幕[\W_]*$",
-    # Untertitel im Auftrag des ZDF (für funk), 2017-2021; Untertitelung des ZDF für funk, 2017; Untert...
-    r"^[\W_]*(?=.*\b(?:ard|zdf|ndr|wdr|swr|br|mdr|hr|rbb|funk|deutschen\W+welle)\b)untertitel(?:ung)?(?:\W+(?:im\W+auftrag|des|der|von|vom|für|und|ard|zdf|ndr|wdr|swr|br|mdr|hr|rbb|funk|deutschen\W+welle|(?:19|20)\d\d))+[\W_]*$",
+    # Untertitel im Auftrag des ZDF (für funk), 2017-2021; Untertitelung des ZDF für funk, 2017; Untertitelung des ZDF.;
+    # Untertitelung. BR 2018: 'des/der <broadcaster>' or '<broadcaster> <year>' (a plain 'Untertitel für ARD und ZDF.' or
+    # 'Untertitel vom ZDF.' is said at work); not asked ('Untertitel des ZDF?' is a question in a meeting)
+    r"^[\W_]*untertitel(?:ung)?(?:\W+im\W+auftrag)?\W+(?:(?:des|der)\W+(?:ard|zdf|ndr|wdr|swr|br|mdr|hr|rbb|funk|deutschen\W+welle)|(?:ard|zdf|ndr|wdr|swr|br|mdr|hr|rbb|funk|deutschen\W+welle)\W+(?:19|20)\d\d)(?:\W+(?:des|der|von|vom|für|und|ard|zdf|ndr|wdr|swr|br|mdr|hr|rbb|funk|deutschen\W+welle|(?:19|20)\d\d))*(?:(?!\?)[\W_])*$",
     # Untertitel von Stephanie Geiges
     r"^[\W_]*untertitel(?:ung)?\W+(?:von\W+)?stephanie\W+geiges[\W_]*$",
     # Copyright WDR 2021; (C) TV GELDERLAND 2021; © BF-WATCH TV 2021 (© is removed by the end-stripping)
@@ -2341,75 +2445,71 @@ MADE_UP_ALWAYS = [re.compile(p, re.I) for p in (
     # www.mooji.org as the whole segment ('Visit www.mooji.org for more.' is kept)
     r"^[\W_]*(?:www\W+)?mooji\W+org[\W_]*$",
 )]
-MADE_UP_DOUBTFUL = [re.compile(p, re.I) for p in (
+MADE_UP_MEDIA = [re.compile(p, re.I) for p in (
     # Thanks for watching! / Thank you (so much) for watching (my video) (until the end) (, please subs...
-    r"^[\W_]*(?:(?:so|well|okay|ok|and)\W+)?(?:thanks|thank\W+you)(?:\W+(?:so|very)\W+much)?(?:\W+(?:all|everyone|guys))?\W+for\W+watching(?:\W+(?:my|this|the|our)\W+(?:video|channel|stream|episode))?(?:\W+(?:until|till|to)\W+the\W+end)?(?:\W+(?:and\W+)?(?:please\W+)?(?:like\W+and\W+)?subscribe)?(?:\W+(?:and\W+)?(?:i\W*ll\W+)?see\W+you\W+(?:in\W+the\W+next\W+(?:one|video)|next\W+time))?[\W_]*$",
-    # Please subscribe; Like and subscribe; Subscribe to my channel
-    r"^[\W_]*(?:(?:please|don\W?t\W+forget\W+to|remember\W+to)\W+)?(?:like\W+(?:and|&)\W+)?subscribe(?:\W+to\W+(?:my|our|the)\W+channel)?[\W_]*$",
-    # This is the end of the video, remember to like and subscribe
-    r"^[\W_]*this\W+is\W+the\W+end\W+of\W+the\W+video(?:\W+remember\W+to\W+like\W+and\W+subscribe)?[\W_]*$",
-    # I'm not sure what I'm doing here
-    r"^[\W_]*i\W*m\W+not\W+sure\W+what\W+i\W*m\W+doing\W+here[\W_]*$",
-    # Subtitles/Captions/Transcribed by <1-3 capitalised words> (unknown names, Transcribed by Otter.ai)
-    r"^[\W_]*(?:subtitles?|captions?|closed\W+captions?(?:ing)?|transcribed|transcription)\W+(?:by|provided\W+by|made\W+by)\W+(?:(?-i:[A-Z])[\w.-]*)(?:\W+(?-i:[A-Z])[\w.-]*){0,2}[\W_]*$",
+    r"^[\W_]*(?:(?:so|well|okay|ok|and)\W+)?(?:thanks|thank\W+you)(?:\W+(?:so|very)\W+much)?(?:\W+(?:all|everyone|guys))?\W+for\W+watching(?:\W+(?:my|this|the|our)\W+(?:video|channel|stream|episode))?(?:\W+(?:everyone|everybody|guys|all))?(?:\W+(?:until|till|to)\W+the\W+end)?(?:\W+(?:and\W+)?(?:please\W+|don\W?t\W+forget\W+to\W+|remember\W+to\W+)?(?:like\W+and\W+)?subscribe)?(?:\W+bye(?:\W+bye)?)?(?:\W+(?:and\W+)?(?:i\W*ll\W+)?see\W+you\W+(?:in\W+the\W+next\W+(?:one|video)|next\W+time))?[\W_]*$",
+    # Like and subscribe; Subscribe to my channel (a bare 'Subscribe (to the channel)' is said at work too: MADE_UP_DOUBTFUL)
+    r"^[\W_]*(?:(?:please|don\W?t\W+forget\W+to|remember\W+to)\W+)?(?:like\W+(?:and|&)\W+subscribe(?:\W+to\W+(?:my|our|the)\W+channel)?|subscribe\W+to\W+my\W+channel)[\W_]*$",
+    # This is the end of the video, remember to like and subscribe (the bare 'This is the end of the video' is said of a
+    # clip shown in a meeting: MADE_UP_DOUBTFUL)
+    r"^[\W_]*this\W+is\W+the\W+end\W+of\W+the\W+video\W+remember\W+to\W+like\W+and\W+subscribe[\W_]*$",
     # Sous-titres par <Name> (dozens of names in the HF dataset, mostly under ht/ln/mg language tags)
     r"^[\W_]*sous\W?titres?\W+par\W+(?-i:[A-ZÀ-Ý])[\w.'-]*(?:\W+(?:et\W+)?(?-i:[A-ZÀ-Ý])[\w.'-]*){0,3}[\W_]*$",
     # ترجمة من قبل <name> ('translation by <name>')
     r"^[\W_]*ترجمة\W+من\W+قبل(?:\W+\w+){1,3}[\W_]*$",
     # Altyazıya teşekkür ederim / teşekkürler ('thanks for the subtitles')
     r"^[\W_]*altyazıya\W+teşekkür(?:\W+ederim|ler)[\W_]*$",
-    # Продолжение следует / Продолжение следует...
-    r"^[\W_]*продолжение\W+следует[\W_]*$",
-    # Спасибо за просмотр / Спасибо за внимание / Спасибо за субтитры
-    r"^[\W_]*спасибо\W+за\W+(?:просмотр|внимание|субтитры)[\W_]*$",
-    # Подписывайтесь на (мой/наш) канал; ПОДПИШИСЬ!; Не забудьте подписаться
-    r"^[\W_]*(?:подписывайтесь|подпишись|подписывайся|не\W+забудьте\W+подписаться)(?:\W+на\W+(?:мой\W+|наш\W+)?канал)?(?:\W+и\W+ставьте\W+лайки?)?[\W_]*$",
+    # Продолжение следует / Продолжение следует... (not asked: 'Продолжение следует?')
+    r"^[\W_]*продолжение\W+следует(?:\W+продолжение\W+следует)*(?:(?!\?)[\W_])*$",
+    # Спасибо за просмотр / Спасибо за субтитры ('Спасибо за внимание' is said in meetings: MADE_UP_DOUBTFUL)
+    r"^[\W_]*спасибо\W+за\W+(?:просмотр(?:\W+(?:этого\W+)?видео)?|субтитры)(?:\W+(?:и\W+)?до\W+новых\W+встреч)?[\W_]*$",
+    # Подписывайтесь на мой канал (и ставьте лайки); Подписывайтесь на канал и ставьте лайки (without 'мой' or the
+    # likes it is said at work too, 'Подпишись на канал': MADE_UP_DOUBTFUL)
+    r"^[\W_]*(?:подписывайтесь|подпишись|подписывайся|не\W+забудьте\W+подписаться)(?:\W+на\W+мой\W+канал(?:\W+и\W+ставьте\W+лайки?)?|(?:\W+на\W+(?:наш\W+)?канал)?(?:\W+(?:и\W+)?(?:ставьте\W+лайки?|жмите\W+(?:на\W+)?колокольчик)){1,2})[\W_]*$",
     # Ставьте лайк(и)
-    r"^[\W_]*ставьте\W+лайки?[\W_]*$",
+    r"^[\W_]*ставь(?:те)?\W+лайки?[\W_]*$",
     # Смотрите продолжение в следующей / во второй / в 4 части (видео)
     r"^[\W_]*смотрите\W+продолжение\W+во?\W+(?:\w+\W+)?част[иь](?:\W+видео)?[\W_]*$",
     # Субтитры <verb> <1-3 capitalised words> with an unknown name (DimaTorzok and «Симон» are in the a...
     r"^[\W_]*субтитры\W+(?:сделал|сделала|делал|делала|создал|создала|создавал|создавала|добавил|добавила|подогнал|подготовил|подготовила|выполнил|перев[её]л)\W+(?-i:[A-ZА-ЯЁ])[\w.-]*(?:\W+(?-i:[A-ZА-ЯЁ])[\w.-]*){0,2}[\W_]*$",
     # Дякую за перегляд!
-    r"^[\W_]*дякую\W+за\W+перегляд[\W_]*$",
-    # Підписуйтесь на наш канал
-    r"^[\W_]*підписуйтесь\W+на\W+(?:наш\W+|мій\W+)?канал[\W_]*$",
+    r"^[\W_]*дякую\W+за\W+перегляд(?:\W+(?:і\W+)?до\W+зустрічі)?[\W_]*$",
+    # Підписуйтесь на мій канал ('… на (наш) канал' is a work channel too: MADE_UP_DOUBTFUL)
+    r"^[\W_]*підписуйтесь\W+на\W+мій\W+канал[\W_]*$",
     # Субтитрувальниця <Name> with a name other than Оля Шор
     r"^[\W_]*субтитрувальни(?:ця|к)\W+(?-i:[А-ЯІЇЄҐ])\w*(?:\W+(?-i:[А-ЯІЇЄҐ])\w*)?[\W_]*$",
     # Vielen Dank fürs / für's Zuschauen; Danke fürs Ansehen; Das war's für heute. Vielen Dank fürs Zus...
     r"^[\W_]*(?:das\W+war\W*s\W+(?:für\W+heute|es)\W+)?(?:vielen\W+)?danke?(?:\W+schön)?\W+f(?:ü|ue)r\W*s?\W+(?:das\W+)?(?:zuschauen|zusehen|ansehen)(?:\W+und\W+bis\W+zum\W+nächsten\W+mal)?(?:\W+tschüss)?[\W_]*$",
-    # Bis zum nächsten Mal
-    r"^[\W_]*bis\W+zum\W+nächsten\W+mal[\W_]*$",
-    # Abonniere meinen Kanal; Bitte abonnieren
-    r"^[\W_]*(?:(?:abonniere|abonniert)\W+(?:meinen|unseren|den)\W+kanal|bitte\W+abonnieren)[\W_]*$",
-    # SWR 2021; ZDF, 2021
-    r"^[\W_]*(?:swr|wdr|ndr|zdf|br|mdr)\W*(?:19|20)\d\d[\W_]*$",
+    # Abonniere meinen Kanal ('Abonniert den Kanal', 'Bitte abonnieren': MADE_UP_DOUBTFUL)
+    r"^[\W_]*(?:abonniere|abonniert)\W+meinen\W+kanal[\W_]*$",
+    # SWR 2021; ZDF, 2021 (not asked: 'SWR 2021?')
+    r"^[\W_]*(?:swr|wdr|ndr|zdf|br|mdr)\W*(?:19|20)\d\d(?:(?!\?)[\W_])*$",
     # Bedankt voor het kijken
     r"^[\W_]*bedankt\W+voor\W+het\W+kijken[\W_]*$",
     # TV Gelderland 2021 (the copyright-prefixed form is always dropped)
     r"^[\W_]*tv\W+gelderland(?:\W+(?:19|20)\d\d)?[\W_]*$",
     # Merci d'avoir regardé (cette vidéo)
     r"^[\W_]*merci\W+d\W*avoir\W+regardé(?:\W+(?:cette|la)\W+vidéo)?[\W_]*$",
-    # Abonnez-vous (à ma chaîne); N'oubliez pas de vous abonner
-    r"^[\W_]*(?:abonnez\W*vous|n\W*oubliez\W+pas\W+de\W+vous\W+abonner)(?:\W+à\W+(?:ma|la|notre)\W+chaîne)?[\W_]*$",
+    # Abonnez-vous à ma chaîne; N'oubliez pas de vous abonner à ma chaîne (bare, 'la' or 'notre': MADE_UP_DOUBTFUL)
+    r"^[\W_]*(?:abonnez\W*vous|n\W*oubliez\W+pas\W+de\W+vous\W+abonner)\W+à\W+ma\W+chaîne[\W_]*$",
     # ¡Gracias por ver (el vídeo)!
     r"^[\W_]*(?:muchas\W+)?gracias\W+por\W+ver(?:\W+el\W+v[ií]deo)?[\W_]*$",
-    # ¡Suscríbete (al canal)!
-    r"^[\W_]*suscr[ií]bete(?:\W+al\W+canal)?[\W_]*$",
+    # ¡Suscríbete a mi canal!; ¡Suscríbete y dale like! (bare or 'al canal': MADE_UP_DOUBTFUL)
+    r"^[\W_]*suscr[ií]bete\W+(?:a\W+mi\W+canal|y\W+dale\W+(?:like|me\W+gusta))[\W_]*$",
     # Grazie per la visione / per aver guardato
     r"^[\W_]*grazie\W+per\W+(?:la\W+visione|aver\W+guardato(?:\W+il\W+video)?)[\W_]*$",
-    # Iscriviti al canale; Non dimenticare di iscriverti
-    r"^[\W_]*(?:iscriviti|non\W+dimenticare\W+di\W+iscriverti)(?:\W+al\W+canale)?[\W_]*$",
+    # Iscriviti al mio canale; Non dimenticare di iscriverti al mio canale (bare or 'al canale': MADE_UP_DOUBTFUL)
+    r"^[\W_]*(?:iscriviti|non\W+dimenticare\W+di\W+iscriverti)\W+al\W+mio\W+canale[\W_]*$",
     # Obrigado/Obrigada por assistir
     r"^[\W_]*obrigad[oa]\W+por\W+assistir(?:\W+ao\W+v[ií]deo)?[\W_]*$",
-    # Inscreva-se no canal
-    r"^[\W_]*inscreva\W*se\W+no\W+canal[\W_]*$",
+    # Inscreva-se no meu canal ('no canal': MADE_UP_DOUBTFUL)
+    r"^[\W_]*inscreva\W*se\W+no\W+meu\W+canal[\W_]*$",
     # nu uitati sa da-ti like si subscribe
     r"^[\W_]*nu\W+uita[tț]i\W+s[aă]\W+(?:da\W*[tț]i|dați)\W+like\W+(?:și|si)\W+subscribe[\W_]*$",
-    # Dziękuję/Dzięki za oglądanie / za uwagę
-    r"^[\W_]*dzi[ęe]k(?:uj[ęe]|i)\W+za\W+(?:oglądanie|uwagę)[\W_]*$",
-    # Subskrybuj (mój kanał)
-    r"^[\W_]*(?:za)?subskrybuj(?:\W+(?:mój|nasz)\W+kanał)?[\W_]*$",
+    # Dziękuję/Dzięki za oglądanie ('za uwagę' is said in meetings: MADE_UP_DOUBTFUL)
+    r"^[\W_]*dzi[ęe]k(?:uj[ęe]|i)\W+za\W+(?:oglądanie|obejrzenie)[\W_]*$",
+    # Subskrybuj mój kanał (bare or 'nasz kanał': MADE_UP_DOUBTFUL)
+    r"^[\W_]*(?:za)?subskrybuj\W+mój\W+kanał[\W_]*$",
     # İzlediğiniz için teşekkür ederim (Python re.I equates İ/i and I/ı, tested)
     r"^[\W_]*izlediğiniz\W+için\W+teşekkür(?:\W+eder(?:im|iz)|ler)[\W_]*$",
     # (Kanalıma) abone olmayı unutmayın
@@ -2442,18 +2542,137 @@ MADE_UP_DOUBTFUL = [re.compile(p, re.I) for p in (
     r"^[\W_]*(?:اشتركوا|اشترك)\W+في\W+القناة[\W_]*$",
     # תודה שצפיתם / תודה על הצפייה / הירשמו לערוץ
     r"^[\W_]*(?:תודה\W+(?:שצפיתם|על\W+הצפייה)|הירשמו\W+לערוץ)[\W_]*$",
+    # (I'll / I can / we'll) see you in the next video / episode (made up 4 times on voice grains in the 1.11.4 harvest;
+    # '… in the next one' is the next meeting too: MADE_UP_MEETING)
+    r"^[\W_]*(?:(?:and|so|okay|ok|but|well)\W+)?(?:i\W*ll|i\W+will|we\W*ll|i\W+can|we\W+can)?\W*see\W+you\W+(?:all\W+|guys\W+)?in\W+the\W+next\W+(?:video|episode)[\W_]*$",
+    # Подпишитесь / Подписаться на мой канал (HF sachaarbonel, tinglongwu; without 'мой': MADE_UP_MEETING)
+    r"^[\W_]*(?:подпишитесь|подписаться)\W+на\W+мой\W+канал[\W_]*$",
+    # Ставьте лайки и подписывайтесь (на канал) (Lapsus, HF sachaarbonel; the other order is above)
+    r"^[\W_]*ставьте\W+лайки?\W+(?:и\W+)?подписывайтесь(?:\W+на\W+(?:мой\W+|наш\W+)?канал)?[\W_]*$",
+    # Подпишись на канал, ставь лайк (и жми колокольчик) (HF sachaarbonel)
+    r"^[\W_]*подпишись\W+на\W+канал\W+ставь\W+лайк(?:\W+и\W+жми\W+колокольчик)?[\W_]*$",
+    # (Всем привет и) добро пожаловать на мой канал; Hello everyone, welcome to my channel; Hallo zusammen und willkommen
+    # auf meinem Kanal (HF sachaarbonel, AGH, Sharrnah)
+    r"^[\W_]*(?:всем\W+привет\W+и\W+)?добро\W+пожаловать\W+на\W+(?:мой|наш)\W+канал[\W_]*$",
+    r"^[\W_]*(?:hello|hi)\W+(?:everyone|everybody|guys)\W+(?:and\W+)?welcome\W+(?:back\W+)?to\W+(?:my|our)\W+channel[\W_]*$",
+    r"^[\W_]*welcome\W+(?:back\W+)?to\W+my\W+channel[\W_]*$",
+    r"^[\W_]*hallo\W+zusammen\W+und\W+willkommen\W+auf\W+meinem\W+kanal[\W_]*$",
+    # Смотрите другие видео; Спасибо, что смотрели; Благодарим за субтитры (HF sachaarbonel, tinglongwu)
+    r"^[\W_]*смотрите\W+другие\W+видео[\W_]*$",
+    r"^[\W_]*спасибо\W+что\W+(?:смотрели|посмотрели\W+(?:это\W+|наше\W+|мо[её]\W+)?видео)[\W_]*$",
+    r"^[\W_]*благодарим\W+за\W+субтитры[\W_]*$",
+    # Субтитры подготовлены / сделаны / созданы <1-3 capitalised words>, a credit (Lapsus; bare, or with a lower-case
+    # tail such as 'для второго ролика', it is a status said at work: MADE_UP_MEETING)
+    r"^[\W_]*субтитры\W+(?:подготовлены|сделаны|созданы)\s+(?-i:[A-ZА-ЯЁ])[\w.-]*(?:\s+(?-i:[A-ZА-ЯЁ])[\w.-]*){0,2}[\W_]*$",
+    # Ich hoffe, euch hat das Video gefallen; (Wenn ja, dann) lasst mir einen Daumen da (und abonniert meinen Kanal) (Sharrnah)
+    r"^[\W_]*ich\W+hoffe\W+euch\W+hat\W+das\W+video\W+gefallen[\W_]*$",
+    r"^[\W_]*(?:wenn\W+ja\W+)?(?:dann\W+)?lasst\W+mir\W+(?:einen\W+)?daumen\W+da(?:\W+und\W+abonniert\W+meinen\W+kanal)?[\W_]*$",
+    # Fortsetzung folgt (tinglongwu); Продовження буде (the Ukrainian 'Продолжение следует'); not asked ('…?')
+    r"^[\W_]*fortsetzung\W+folgt(?:(?!\?)[\W_])*$",
+    r"^[\W_]*(?:wir\W+sehen\W+uns\W+im|bis\W+zum)\W+nächsten\W+video[\W_]*$",
+    r"^[\W_]*продовження\W+буде(?:(?!\?)[\W_])*$",
+    # Sound captions written without brackets: (Piano) music continues / playing; Bell rings; Birds chirping (discussion
+    # 1873); not asked ('Music playing?', 'Phone rings?')
+    r"^[\W_]*(?:(?:soft|piano|upbeat|gentle|dramatic)\W+)?music\W+(?:continues|playing|plays|fades)(?:(?!\?)[\W_])*$",
+    r"^[\W_]*(?:bell|phone|doorbell)\W+rings(?:(?!\?)[\W_])*$",
+    r"^[\W_]*birds?\W+(?:chirp|chirps|chirping|singing)(?:(?!\?)[\W_])*$",
 )]
+MADE_UP_DOUBTFUL = [re.compile(p, re.I) for p in (
+    # I'm not sure what I'm doing here
+    r"^[\W_]*i\W*m\W+not\W+sure\W+what\W+i\W*m\W+doing\W+here[\W_]*$",
+    # This is the end of the video (also said of a clip shown in a meeting; with the plug after it: MADE_UP_MEDIA)
+    r"^[\W_]*this\W+is\W+the\W+end\W+of\W+the\W+video(?:(?!\?)[\W_])*$",
+    # Спасибо за внимание
+    r"^[\W_]*спасибо\W+за\W+внимание[\W_]*$",
+    # Dziękuję/Dzięki za uwagę
+    r"^[\W_]*dzi[ęe]k(?:uj[ęe]|i)\W+za\W+uwagę[\W_]*$",
+    # Subtitles/Captions/Transcribed by <1-3 capitalised words> (unknown names, Transcribed by Otter.ai; also 'Captions by
+    # Friday', 'Transcription by Whisper' in a meeting, so not dropped by its text)
+    r"^[\W_]*(?:subtitles?|captions?|closed\W+captions?(?:ing)?|transcribed|transcription)\W+(?:by|provided\W+by|made\W+by)\W+(?:(?-i:[A-Z])[\w.-]*)(?:\W+(?-i:[A-Z])[\w.-]*){0,2}[\W_]*$",
+    # Please subscribe; Subscribe (to our/the channel) (a button, a Slack or Teams channel; the plugs are MADE_UP_MEDIA)
+    r"^[\W_]*(?:(?:please|don\W?t\W+forget\W+to|remember\W+to)\W+)?(?:like\W+(?:and|&)\W+)?subscribe(?:\W+to\W+(?:my|our|the)\W+channel)?[\W_]*$",
+    # Подписывайтесь / Подпишись на (наш) канал; ПОДПИШИСЬ!; Не забудьте подписаться
+    r"^[\W_]*(?:подписывайтесь|подпишись|подписывайся|не\W+забудьте\W+подписаться)(?:\W+на\W+(?:мой\W+|наш\W+)?канал)?(?:\W+и\W+ставьте\W+лайки?)?[\W_]*$",
+    # Abonniert den / unseren Kanal; Bitte abonnieren
+    r"^[\W_]*(?:(?:abonniere|abonniert)\W+(?:meinen|unseren|den)\W+kanal|bitte\W+abonnieren)[\W_]*$",
+    # The bare, 'our' and 'the' channel plug in Ukrainian, French, Spanish, Italian, Portuguese, Polish (a work channel
+    # too; the 'my channel' forms are MADE_UP_MEDIA)
+    r"^[\W_]*підписуйтесь\W+на\W+(?:наш\W+)?канал[\W_]*$",
+    r"^[\W_]*(?:abonnez\W*vous|n\W*oubliez\W+pas\W+de\W+vous\W+abonner)(?:\W+à\W+(?:la|notre)\W+chaîne)?[\W_]*$",
+    r"^[\W_]*suscr[ií]bete(?:\W+al\W+canal)?[\W_]*$",
+    r"^[\W_]*(?:iscriviti|non\W+dimenticare\W+di\W+iscriverti)(?:\W+al\W+canale)?[\W_]*$",
+    r"^[\W_]*inscreva\W*se\W+no\W+canal[\W_]*$",
+    r"^[\W_]*(?:za)?subskrybuj(?:\W+nasz\W+kanał)?[\W_]*$",
+)]
+# Phrases a meeting says as well, first listed in 1.11.4: dropped like MADE_UP_DOUBTFUL only with a sign that nobody said
+# them, but never for coming again: several people on one track say "See you tomorrow." at the end of a call.
+MADE_UP_MEETING = [re.compile(p, re.I) for p in (
+    # Спасибо за внимание и до новых встреч; До новых встреч (Lapsus, HF sachaarbonel)
+    r"^[\W_]*спасибо\W+за\W+внимание\W+и\W+до\W+новых\W+встреч[\W_]*$",
+    r"^[\W_]*до\W+новых\W+встреч[\W_]*$",
+    r"^[\W_]*(?:дякую\W+за\W+увагу|до\W+зустрічі)[\W_]*$",
+    # (Okay,) (I'll) see you next time / soon / later / next week / tomorrow (the 1.11.4 harvest: 'I'll see you next time.')
+    r"^[\W_]*(?:(?:okay|ok|so|and|well|alright|all\W+right)\W+)?(?:i\W*ll|we\W*ll|i\W+will)?\W*see\W+you\W+(?:all\W+|guys\W+)?(?:next\W+time|soon|later|next\W+week|tomorrow)[\W_]*$",
+    # Bis zum nächsten Mal (a goodbye several people say, like 'Until next time')
+    r"^[\W_]*bis\W+zum\W+nächsten\W+mal[\W_]*$",
+    # Das war's für heute (Sharrnah)
+    r"^[\W_]*das\W+war\W*s\W+für\W+heute[\W_]*$",
+    # (So) until next time (, bye for now) (AGH)
+    r"^[\W_]*(?:so\W+)?until\W+next\W+time(?:\W+bye(?:\W+for\W+now)?)?[\W_]*$",
+    # (I'll) see you in the next one (the next meeting as well as the next video)
+    r"^[\W_]*(?:(?:and|so|okay|ok|but|well)\W+)?(?:i\W*ll|i\W+will|we\W*ll|i\W+can|we\W+can)?\W*see\W+you\W+(?:all\W+|guys\W+)?in\W+the\W+next\W+one[\W_]*$",
+    # Подпишитесь / Подписаться на (наш) канал (a work channel too)
+    r"^[\W_]*(?:подпишитесь|подписаться)\W+на\W+(?:наш\W+)?канал[\W_]*$",
+    # Субтитры подготовлены / сделаны / созданы, with nothing after it (a status: 'the subtitles are done')
+    r"^[\W_]*субтитры\W+(?:подготовлены|сделаны|созданы)[\W_]*$",
+)]
+# Short thanks, goodbyes and one-word captions: the commonest lines Whisper makes up on non-speech ('Thank you.' 24.76 %
+# of large-v3's, Barański et al. 2025, Table III; turbo: 'Vielen Dank', 'Thank you', 'Musik'), and real replies as often.
+MADE_UP_SHORT = [re.compile(p, re.I) for p in (
+    r"^[\W_]*(?:thank\W+you|thanks)(?:\W+(?:so|very)\W+much)?(?:\W+(?:all|everyone|guys))?[\W_]*$",
+    r"^[\W_]*(?:(?:большое|огромное)\W+)?спасибо(?:\W+(?:большое|огромное|всем))?[\W_]*$",
+    r"^[\W_]*всем\W+спасибо[\W_]*$",
+    r"^[\W_]*(?:(?:щиро|дуже)\W+)?дякую(?:\W+(?:вам|всім|дуже))?[\W_]*$",
+    r"^[\W_]*(?:vielen\W+)?dank(?:e)?(?:\W+(?:schön|sehr))?[\W_]*$",
+    r"^[\W_]*(?:muchas\W+)?gracias[\W_]*$",
+    r"^[\W_]*(?:muito\W+)?obrigad[oa][\W_]*$",
+    r"^[\W_]*merci(?:\W+beaucoup)?[\W_]*$",
+    r"^[\W_]*grazie(?:\W+mille)?[\W_]*$",
+    r"^[\W_]*(?:bye|bye\W+bye|tschüss|(?:всем\W+)?пока|пока\W+пока|до\W+свидания|до\W+побачення|бувайте)[\W_]*$",
+    r"^[\W_]*(?:музыка|musik|music)[\W_]*$",
+)]
+# A whole line of sound captions in brackets or asterisks: [Music], [APPLAUSE], (Musik), * Musik *, *Klopfen*, ♪♪, ♪ Musik ♪
+# (discussion 1873; marmalade). Whisper does not write speech inside brackets; it does write sung words between ♪, so
+# between ♪ only one word counts, or two when one is a music word ('♪ Sanfte Musik ♪'): '♪ Happy birthday ♪' and
+# '♪ Happy birthday to you ♪' are a team singing on a call.
+_W = r"[^\s\[\]()*♪]+"
+_MUSIC = r"(?i:music|musik|музыка|musique|m[uú]sica)"
+MADE_UP_CAPTION = re.compile(r"^\s*(?:(?:[\[(*]\s*[^\[\]()*♪]{1,40}?\s*[\])*]|♪\s*(?:" + _MUSIC + r"\s+" + _W + r"|" + _W + r"\s+"
+                             + _MUSIC + r"|" + _W + r")?\s*♪)\s*)+$"
+                             r"|^\s*[♪♫¶]+\s*$")
+# A line timed this far past the end of its audio: Whisper timed words in the zero padding. Lines made up on noise end at
+# the end of Whisper's 30 s window (5.8-29 s past the audio in the 1.11.4 harvest and noise runs); real words of a
+# 1-1.4 s chunk can end at a round second after it (up to 1.62 s past the audio measured: 'барсук' on a 1.37 s chunk).
+OVERHANG_S = 5.0
 
 
 def _made_up_kind(sentence):
-    """'always', 'doubtful' or None for one sentence (NFKC, spaces collapsed)."""
+    """'always', 'media', 'doubtful', 'meeting', 'short' or None for one sentence (NFKC, spaces collapsed)."""
     plain = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", sentence)).strip()
     if not plain:
         return None
-    if any(p.match(plain) for p in MADE_UP_ALWAYS):
+    if MADE_UP_CAPTION.match(plain) or any(p.match(plain) for p in MADE_UP_ALWAYS):
         return "always"
+    # A question is never a video's phrase ('Thanks for watching?', 'Субтитры сделал Иван?': asked in a meeting)
+    asked = "?" in re.search(r"[\W_]*$", plain).group()
+    if not asked and any(p.match(plain) for p in MADE_UP_MEDIA):
+        return "media"
     if any(p.match(plain) for p in MADE_UP_DOUBTFUL):
         return "doubtful"
+    if any(p.match(plain) for p in MADE_UP_MEETING):
+        return "meeting"
+    if any(p.match(plain) for p in MADE_UP_SHORT):
+        return "short"
     return None
 
 
@@ -2470,52 +2689,114 @@ def _sentences(text):
     return [p for p in parts if p]
 
 
+def _sentence_kinds(text):
+    """The kinds of a line's sentences; the last two count as one credit when joined they are one ("Untertitelung. BR
+    2018", which _sentences cuts in two)."""
+    parts = _sentences(text)
+    kinds = [_made_up_kind(s) for s in parts] or [None]
+    if len(parts) >= 2 and _made_up_kind(" ".join(parts[-2:])) == "always":
+        kinds[-2:] = ["always", "always"]
+    return kinds
+
+
 def _stretched(line):
-    """Whether a line lasts at least 3 s and 2.5 times as long as its words take to say (about 12 letters a second;
-    5 characters a second for Han, Kana and Hangul): a short phrase Whisper spread over near-silence."""
+    """Whether a line lasts at least 5 s and 2.5 times as long as its words take to say (about 12 letters a second;
+    5 characters a second for Han, Kana and Hangul): a short phrase Whisper spread over near-silence. Not 3 s: on a
+    1-1.4 s chunk Whisper ends real words at a round 2 or 3 s after their start ('\u0431\u0430\u0440\u0441\u0443\u043a' at 1.1-4.1 s, 1.11.4); the
+    outros it made up on noise lasted about 30 s."""
     seconds = (line.get("end") or line["t"]) - line["t"]
     text = line.get("text", "")
     wide = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text))
     letters = len(re.findall(r"\w", text)) - wide
-    return seconds >= 3.0 and seconds >= 2.5 * (letters / 12 + wide / 5)
+    return seconds >= 5.0 and seconds >= 2.5 * (letters / 12 + wide / 5)
 
 
-def made_up(line, alone=True):
-    """Why a spoken line is one Whisper made up on noise ("a subtitle credit", "an outro over near-silence"), or None.
-    alone: it is the only spoken line of its chunk (an outro counts only then)."""
+def _overhangs(line, audio_end):
+    """Whether Whisper timed the line OVERHANG_S or more past the end of its chunk's audio, into the padding: words where
+    there was no sound (see OVERHANG_S)."""
+    return audio_end is not None and (line.get("end") or line["t"]) - audio_end >= OVERHANG_S
+
+
+def _failed(line):
+    """Whether the line's decode still failed Whisper's own thresholds (average log-probability -1.0, compression ratio
+    2.4) after the temperature fallback: the engine kept a result it had rejected. Only lines just decoded carry these
+    values (_lp, _temp, _cr: segment_lines), never a line read from a checkpoint."""
+    if (line.get("_temp") or 0.0) <= 0:
+        return False
+    return (line.get("_lp") is not None and line["_lp"] < -1.0) or (line.get("_cr") or 0.0) > 2.4
+
+
+def made_up(line, alone=True, audio_end=None, context="media"):
+    """Why a spoken line is one Whisper made up on noise, or None. alone: it is the only spoken line of its chunk;
+    audio_end: where the audio of its chunk (or piece) ends, in seconds (None: not known, as for a checkpoint's lines);
+    context: "recording" (a recording or a call: a video's outro or channel plug is dropped by its text) or "media" (an
+    imported file, which may be such a video: only with a sign that nobody said it). A meeting's outro and a short thanks
+    are never dropped by their text alone."""
+    outro = ("media", "doubtful", "meeting")
     text = line.get("text") or ""
-    kinds = [_made_up_kind(s) for s in _sentences(text)] or [None]
+    kinds = _sentence_kinds(text)
     whole = _made_up_kind(text)
-    if whole == "always" or (all(kinds) and "always" in kinds):
+    if whole == "always" or (all(k in ("always", "media") for k in kinds) and "always" in kinds):
         return "a subtitle credit"
-    if (whole == "doubtful" or all(k == "doubtful" for k in kinds)) and alone and _stretched(line):
+    media = whole == "media" or all(k == "media" for k in kinds)
+    if context == "recording" and media:
+        return "a video's outro or channel plug"
+    over, stretched = _overhangs(line, audio_end), alone and _stretched(line)
+    if media and (stretched or over):
         return "an outro over near-silence"
+    if media and _failed(line):
+        return "a video's phrase Whisper itself rejected"
+    # A meeting's outro ("Спасибо за внимание") that was mumbled is still said: a failed decode is no sign for it
+    if (whole in outro or all(k in outro for k in kinds)) and (stretched or over):
+        return "an outro over near-silence"
+    short = whole == "short" or (all(k in ("short", *outro) for k in kinds) and "short" in kinds)
+    if short and alone and over:
+        return "thanks over near-silence"
     return None
 
 
-def _trim_credits(text):
-    """A real line without the credit sentences Whisper put before or after it ("Доклад окончен. Субтитры сделал …")."""
+def _trim_credits(text, over=False, recording=False):
+    """A real line without the credit sentences Whisper put before or after it ("Доклад окончен. Субтитры сделал …").
+    over: the line runs past the end of its audio, so an outro sentence at its end comes off too. recording: a
+    recording or a call, where a video's phrase at its end comes off without that sign (as a whole line of one is
+    dropped by its text there); a meeting's outro and a short thanks still need it."""
     parts = _sentences(text)
-    while len(parts) > 1 and _made_up_kind(parts[-1]) == "always":
-        parts.pop()
+    while len(parts) > 1:
+        last = _made_up_kind(parts[-1])
+        if last == "always":
+            parts.pop()
+        elif len(parts) > 2 and _made_up_kind(" ".join(parts[-2:])) == "always":
+            del parts[-2:]                             # a credit cut in two ("Untertitelung." + "BR 2018", itself a video's tag)
+        elif (over and last in ("media", "doubtful", "meeting")) or (recording and last == "media"):
+            parts.pop()
+        else:
+            break
     while len(parts) > 1 and _made_up_kind(parts[0]) == "always":
         parts.pop(0)
     return " ".join(parts) if parts else text
 
 
-def screen_made_up(lines):
-    """The lines of one chunk, with those Whisper made up on noise marked (`made_up`: why) and credit sentences trimmed
-    off the ends of real ones. The marked lines are kept in the checkpoint (they are counted at the end) but never shown,
-    translated or written. Running it again on the same lines changes nothing."""
+def screen_made_up(lines, audio_end=None, context="media"):
+    """The lines of one chunk (or piece), with those Whisper made up on noise marked (`made_up`: why) and credit
+    sentences trimmed off the ends of real ones. The marked lines are kept in the checkpoint (they are counted at the
+    end) but never shown, translated or written. audio_end: where the chunk's audio ends, in seconds (decode_chunk
+    passes it; see made_up). The values only a fresh decode has (_lp, _temp, _cr) are removed. Running it again on the
+    same lines changes nothing."""
     spoken = [l for l in lines if "text" in l]
     for line in spoken:
         if line.get("made_up"):
             continue
-        why = made_up(line, alone=len(spoken) == 1)
+        why = made_up(line, alone=len(spoken) == 1, audio_end=audio_end, context=context)
+        if not why:
+            trimmed = _trim_credits(line["text"], _overhangs(line, audio_end), context == "recording")
+            if trimmed != line["text"]:                # what is left is screened too ('Спасибо.' timed 28 s past its audio)
+                line["text"] = trimmed
+                why = made_up(line, alone=len(spoken) == 1, audio_end=audio_end, context=context)
         if why:
             line["made_up"] = why
-        else:
-            line["text"] = _trim_credits(line["text"])
+    for line in lines:
+        for key in ("_lp", "_temp", "_cr"):
+            line.pop(key, None)
     return lines
 
 
@@ -2523,20 +2804,57 @@ def without_made_up(lines):
     return [l for l in lines if not l.get("made_up")]
 
 
+def outro_key(line):
+    """What makes two outros the same, for counting them (case, punctuation and spacing aside)."""
+    return re.sub(r"\W+", " ", unicodedata.normalize("NFKC", line["text"]).casefold()).strip()
+
+
+def is_outro(line):
+    """An outro or a video's phrase, which a real meeting or video says once, not again and again (a short thanks is
+    not one: three real "Thank you." on one track are normal)."""
+    return "text" in line and _made_up_kind(line["text"]) in ("doubtful", "media")
+
+
+REPEATED = "an outro said again and again"
+
+
 def drop_repeated_outros(lines, times=3, left_out=()):
     """The track's lines without the outros that come `times` times or more (Whisper's "Продолжение следует" every 30 s
     on noise, openai/whisper discussion 1873; a real video says its outro once), and how many were left out.
     left_out: the made-up lines already taken out of `lines` (an outro spread over near-silence); they count toward the
     `times` but are not counted again among those left out."""
-    def key(l):
-        return re.sub(r"\W+", " ", unicodedata.normalize("NFKC", l["text"]).casefold()).strip()
-
-    def outro(l):
-        return "text" in l and _made_up_kind(l["text"]) == "doubtful"
-    counts = collections.Counter(key(l) for l in [*lines, *left_out] if outro(l))
+    counts = collections.Counter(outro_key(l) for l in [*lines, *left_out] if is_outro(l))
     repeated = {k for k, n in counts.items() if n >= times}
-    kept = [l for l in lines if not (outro(l) and key(l) in repeated)]
+    kept = [l for l in lines if not (is_outro(l) and outro_key(l) in repeated)]
     return kept, len(lines) - len(kept)
+
+
+def mark_repeated_outros(track, lines, times=3):
+    """drop_repeated_outros while recording, for one live track and the lines of its latest chunk: the outros are counted
+    by outro_key (the hidden ones too, as left_out is at the end); the copy that reaches `times` and every one after it
+    are marked made up, and so are the earlier copies not yet marked. Returns whether a copy shown in an earlier chunk
+    was marked: the window is then sent its lines again (LiveWorker.resend); copies earlier in these same lines were
+    never shown, so marking them needs no resend. The earlier chunks' copies were written to the checkpoint unmarked:
+    LiveTrack.decode writes those chunks again with the mark, so the final pass neither shows nor sends them."""
+    state = vars(track)                                # made on first use (a track built without __init__, as in a test)
+    counts = state.setdefault("outro_count", collections.Counter())
+    shown = state.setdefault("shown_outros", collections.defaultdict(list))
+    here = {id(line) for line in lines}                # this chunk's lines: not on screen yet
+    withdrawn = False
+    for line in lines:
+        if not is_outro(line):
+            continue
+        k = outro_key(line)
+        counts[k] += 1
+        if counts[k] >= times:
+            if not line.get("made_up"):
+                line["made_up"] = REPEATED
+            for earlier in shown.pop(k, []):
+                earlier["made_up"] = REPEATED
+                withdrawn = withdrawn or id(earlier) not in here
+        elif not line.get("made_up"):
+            shown[k].append(line)
+    return withdrawn
 
 
 def made_up_note(count, position=None):
@@ -2545,7 +2863,8 @@ def made_up_note(count, position=None):
 
 
 def segment_lines(segs, a, lang, conf, guess, speaker):
-    """The lines of decoded segments that start at sample a."""
+    """The lines of decoded segments that start at sample a. What the engine reported of each decode (log-probability,
+    temperature, compression ratio) goes along as _lp, _temp, _cr for screen_made_up, which removes them."""
     new = []
     for s in segs:
         if s["text"].strip():
@@ -2555,16 +2874,20 @@ def segment_lines(segs, a, lang, conf, guess, speaker):
                 line["guess"] = True
             if speaker:
                 line["speaker"] = speaker
+            for key, signal in (("logprob", "_lp"), ("temp", "_temp"), ("cr", "_cr")):
+                if s.get(key) is not None:
+                    line[signal] = s[key]
             new.append(line)
     return new
 
 
-def decode_chunk(engine, chunk, a, allowed, forced, speaker, adaptive=False):
+def decode_chunk(engine, chunk, a, allowed, forced, speaker, adaptive=False, context="media"):
     """The lines of one chunk starting at sample a: language decision, decoding, notes for a chunk without a result.
     adaptive: when the chunk's language probabilities look mixed (looks_mixed), it is re-cut at the finest settings
     (pauses of 200 ms, pieces of at least 1 s) and, when that gives two or more pieces, each piece gets its own language
     decision and decoding, so a switch inside the chunk gets its own tag; with one piece the chunk is decoded as it is.
-    The re-cut is a VAD pass over at most 30 s (well under a second); each piece is one more Whisper pass."""
+    The re-cut is a VAD pass over at most 30 s (well under a second); each piece is one more Whisper pass.
+    context: "recording" (a recording or a call) or "media" (an imported file), for screen_made_up."""
     state = engine.analyse(chunk, detect=forced is None)
     if adaptive and not forced and looks_mixed(state.probs):
         spans = speech_spans(chunk, 0, GRANULARITY["finest"][1])
@@ -2574,13 +2897,13 @@ def decode_chunk(engine, chunk, a, allowed, forced, speaker, adaptive=False):
             for ps, pe in pieces:
                 piece = engine.analyse(chunk[ps:pe], detect=True)
                 segs, lang, conf, guess = decode_unit(engine, piece, allowed, forced)
-                lines = screen_made_up(segment_lines(segs, a + ps, lang, conf, guess, speaker))
+                lines = screen_made_up(segment_lines(segs, a + ps, lang, conf, guess, speaker), (a + pe) / RATE, context)
                 if not lines:                          # a piece that gave nothing is said, like a chunk that gave nothing
                     lines = [{"t": round((a + ps) / RATE, 1), "note": f"speech not recognised for {round((pe - ps) / RATE)} s"}]
                 new.extend(lines)
             return new
     segs, lang, conf, guess = decode_unit(engine, state, allowed, forced)
-    new = screen_made_up(segment_lines(segs, a, lang, conf, guess, speaker))
+    new = screen_made_up(segment_lines(segs, a, lang, conf, guess, speaker), (a + len(chunk)) / RATE, context)
     if not new:
         new.append({"t": round(a / RATE, 1), "note": f"speech not recognised for {round(len(chunk) / RATE)} s"})
     return new
@@ -2617,12 +2940,23 @@ def in_time_order(lines):
     return sorted(lines, key=lambda l: l["t"])
 
 
+def screening_context(src, d):
+    """"recording" for a meeting this program recorded (record transcribing itself, or the app's queued job: the
+    audio.wav in its own data folder), else "media": an imported file, which may be a published video, whose outros and
+    channel plugs are then really said (screen_made_up)."""
+    try:
+        return "recording" if Path(src).name == "audio.wav" and Path(src).resolve().parent == Path(d).resolve() else "media"
+    except (OSError, RuntimeError, TypeError):
+        return "media"
+
+
 def transcribe(src, d, language=None, track=None, granularity="auto", notes=None, speakers=None, diarizer="sherpa"):
     """The transcript of one file, saved in the data folder d; a run cut short is continued from its checkpoint there.
     speakers ("auto" or a number) labels who spoke."""
     if EVENTS:
         ev("FOLDER", d)
-    lines = in_time_order(header_notes(notes) + transcribe_lines(src, language, track, granularity, checkpoint=d, speakers=speakers, diarizer=diarizer))
+    lines = in_time_order(header_notes(notes) + transcribe_lines(src, language, track, granularity, checkpoint=d, speakers=speakers,
+                                                                 diarizer=diarizer, context=screening_context(src, d)))
     doc = {"source": str(src), "whisper": WHISPER, "lines": lines, "translations": {}}
     _keep_outputs(d, doc)
     _save(d, doc)
@@ -2787,7 +3121,7 @@ def transcribe_call(mic, system, d, me="You", them="Them", language=None, granul
     if EVENTS:
         ev("FOLDER", d)
         ev("STAGE", "Transcribing your microphone (track 1 of 2)")
-    mine = transcribe_lines(mic, language, None, granularity, position=(1, 2), checkpoint=d,
+    mine = transcribe_lines(mic, language, None, granularity, position=(1, 2), checkpoint=d, context="recording",
                             **({} if speakers is None else dict(speakers="auto", diarizer=diarizer, label=speaker_name(me, "You"))))
     if speakers is not None:
         mine = one_voice_plain(mine)
@@ -2795,7 +3129,7 @@ def transcribe_call(mic, system, d, me="You", them="Them", language=None, granul
         ev("STAGE", "Transcribing the other side (track 2 of 2)")
     extra = []
     try:
-        theirs = transcribe_lines(system, language, None, granularity, position=(2, 2), checkpoint=d,
+        theirs = transcribe_lines(system, language, None, granularity, position=(2, 2), checkpoint=d, context="recording",
                                   speakers=speakers, diarizer=diarizer, label=speaker_name(them, "Them"))
     except Exception as e:                                    # the other side is lost, your side is not
         theirs = []
@@ -2870,18 +3204,32 @@ _NLLB_VARIANTS = {"ptbr": "por_Latn", "ptpt": "por_Latn", "zhtw": "zho_Hant", "z
 
 
 def model_present(repo):
-    """Whether a Hugging Face model is in the local cache (nothing is downloaded)."""
+    """Whether a Hugging Face model is in the local cache, or `repo` is a local folder (MT_HY_MODEL, MT_GEMMA_MODEL), which
+    is used as it is (nothing is downloaded)."""
+    if repo == HY_DEFAULT and HY == HY_DEFAULT:
+        return hy_present()                          # pinned files from two repositories, each looked up on its own
+    if Path(repo).expanduser().is_dir():
+        return True                                  # huggingface_hub takes no path as a repo id (HFValidationError)
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(repo, local_files_only=True)
-        return True
+        path = snapshot_download(repo, local_files_only=True)
+        return repo != NLLB or _nllb_weights_here(path)
     except Exception:
         return False
+
+
+def _nllb_weights_here(path):
+    """Whether NLLB's snapshot folder holds its weights: a download cut short (no network, HTTP 429) leaves the folder with
+    the small files only, which snapshot_download(local_files_only=True) still returns."""
+    return os.path.isfile(os.path.join(path, "model.bin"))
 
 
 def fetch_model(repo, size, stage=True):
     """The model in the local cache, downloaded once when it is not; raises when it cannot be fetched. `stage` says so as
     a stage of the job; during a recording it is a plain line (a stage would end the window's Recording panel)."""
+    if repo == HY_DEFAULT and HY == HY_DEFAULT:
+        fetch_hy(stage)                              # also when present: its files are checked before a long job
+        return
     if model_present(repo):
         return
     from huggingface_hub import snapshot_download
@@ -2892,11 +3240,11 @@ def fetch_model(repo, size, stage=True):
 
 
 def translation_models(targets, offline):
-    """(repo, size) of the local models a translation into `targets` needs: TranslateGemma when it is chosen and a
-    target is one of its languages; NLLB in every case (with TranslateGemma, for the lines in a language it lacks)."""
+    """(repo, size) of the local models a translation into `targets` needs: TranslateGemma or Hy-MT3 when it is chosen
+    and a target is one of its languages; NLLB in every case (beside either, for the lines in a language it lacks)."""
     if not offline or not targets:
         return []
-    models = [(GEMMA, "about 7 GB")] if TRANSLATOR == "gemma" and any(gemma_code(t) for t in targets) else []
+    models = [(llm_repo(), llm_size())] if llm_on() and any(llm_code(t) for t in targets) else []
     return models + [(NLLB, "about 1.4 GB")]
 
 
@@ -2917,6 +3265,8 @@ def _load_nllb():
 
     try:
         path = snapshot_download(NLLB, local_files_only=True)
+        if not _nllb_weights_here(path):
+            raise FileNotFoundError(os.path.join(path, "model.bin"))      # a download cut short: the rest is fetched
     except Exception:
         text = f"Downloading the translation model {NLLB} (first time only, about 1.4 GB)"
         ev("STAGE", text) if EVENTS else print(text, file=sys.stderr)
@@ -2966,9 +3316,10 @@ def gemma_code(name):
     return code if code in GEMMA_LANGS else None
 
 
-def gemma_available():
-    """Apple silicon with the mlx-lm package installed (the app's Apple-GPU setup step installs it). Looked up without
-    importing it: mlx-lm makes its generation stream when it is imported (see _thread_stream)."""
+def mlx_lm_available():
+    """Apple silicon with the mlx-lm package installed: TranslateGemma and Hy-MT3 need it (the app's Apple-GPU setup step
+    installs it). Looked up without importing it: mlx-lm makes its generation stream when it is imported (see
+    _thread_stream)."""
     import importlib.util
     import platform
 
@@ -3040,23 +3391,282 @@ def release_gemma():
     gc.collect()
 
 
-def _gemma_pieces(text):
-    """A text in pieces of at most GEMMA_PIECE characters, of whole sentences where it can (a longer sentence at words)."""
-    if len(text) <= GEMMA_PIECE:
+# ---------- Hy-MT3: the third offline translator (Apple silicon, through mlx-lm) ----------
+# Tencent's Hy-MT3-7B (24 Nov 2026, https://huggingface.co/tencent/Hy-MT3-7B), 102 languages, Apache-2.0 ("does not impose
+# any additional restrictions beyond those specified in the license", its LICENSE.txt). The weights are NetProjects' 4-bit
+# MLX copy (affine, group size 64, converted from Tencent's revision f83bea8; weights and tokenizer unchanged up to 38d6c3c):
+# its tensors match what mlx-lm 0.29.1 builds for hunyuan_v1_dense, name for name and shape for shape. Its own
+# tokenizer_config.json names TokenizersBackend, a class of transformers 5 (the app pins 4.57.6), so the tokenizer files
+# are Tencent's own, which load and give the same ids. The quality figures so far are Tencent's (no independent evaluation
+# yet); its memory is not measured here (about 4.5 GB is an estimate from the same-size Hy-MT2-7B, 4.53 GB at peak).
+HY_FILES = (   # (repo, commit, file, bytes, sha256): everything the default needs, each fetched and checked on its own
+    (HY_DEFAULT, "dca6fb32e6d61d2657ed714b572307216df2cb5c", "config.json", 1721,
+     "be19177093a8e49915052d463e28d78cc14b4124731a17b3549bc608bfdeb9d0"),
+    (HY_DEFAULT, "dca6fb32e6d61d2657ed714b572307216df2cb5c", "model.safetensors", 4221806239,
+     "81176df138f651ced6f827956d8c767dcbf8a99399f3a2040ad3dbfb2ef7ccc1"),
+    (HY_DEFAULT, "dca6fb32e6d61d2657ed714b572307216df2cb5c", "LICENSE.txt", 9673,
+     "974b62424d5627567283a4808181293e3ea53894cea7e75341d8e9f5f1b874cc"),
+    (HY_DEFAULT, "dca6fb32e6d61d2657ed714b572307216df2cb5c", "NOTICE", 447,
+     "84f60c1684c896850a314f36f877b0e1ec306916d8c51a11c0a35f5d8fa89e38"),
+    ("tencent/Hy-MT3-7B", "38d6c3c31d6b4dbdfc208e0621b822ae7bf6aeb2", "tokenizer.json", 16388221,
+     "4185389a69284fdd3ebf737c6120bbeee36cbed9763151fa5bac5986a39e05d4"),
+    ("tencent/Hy-MT3-7B", "38d6c3c31d6b4dbdfc208e0621b822ae7bf6aeb2", "tokenizer_config.json", 37763,
+     "1fffdb809549222938f4a732645dd984c7c0b2973d592c2d01e05425274317da"),
+    ("tencent/Hy-MT3-7B", "38d6c3c31d6b4dbdfc208e0621b822ae7bf6aeb2", "special_tokens_map.json", 431,
+     "c6571f2ee67c36fa93d7f688ee6fd43f5b84784e895f3e6a4eb8c2657379758e"),
+    ("tencent/Hy-MT3-7B", "38d6c3c31d6b4dbdfc208e0621b822ae7bf6aeb2", "chat_template.jinja", 662,
+     "788ac16c5d7bfefc28655928ad524c8f378a44cb24d24fb125d6a5859b167677"),
+)
+HY_CHECKED = "hy-mt3-checked.json"    # in MODELS_DIR: {blob path: [size, mtime_ns, sha256]} of the big file once checked
+# The languages of the card's tables that Whisper tags lines with (89 of its 100) and Traditional Chinese, by the English
+# name the prompt takes, spelled as on the card. Whisper's Kazakh and Mongolian are written in Cyrillic, the card's plain
+# kk and mn are the Arabic and the traditional scripts; Whisper's no and jw are the card's nb and jv. Not on the card, so
+# NLLB's: Breton, Bosnian, Faroese, Hausa, Hawaiian, Latin, Lingala, Maori, Occitan, Shona, Yoruba.
+HY_NAMES = {
+    "af": "Afrikaans", "am": "Amharic", "ar": "Arabic", "as": "Assamese", "az": "Azerbaijani", "ba": "Bashkir",
+    "be": "Belarusian", "bg": "Bulgarian", "bn": "Bengali", "bo": "Tibetan", "ca": "Catalan", "cs": "Czech", "cy": "Welsh",
+    "da": "Danish", "de": "German", "el": "Greek", "en": "English", "es": "Spanish", "et": "Estonian", "eu": "Basque",
+    "fa": "Persian", "fi": "Finnish", "fr": "French", "gl": "Galician", "gu": "Gujarati", "he": "Hebrew", "hi": "Hindi",
+    "hr": "Croatian", "ht": "Haitian Creole", "hu": "Hungarian", "hy": "Armenian", "id": "Indonesian", "is": "Icelandic",
+    "it": "Italian", "ja": "Japanese", "jw": "Javanese", "ka": "Georgian", "kk": "Cyrillic Kazakh", "km": "Khmer",
+    "kn": "Kannada", "ko": "Korean", "lb": "Luxembourgish", "lo": "Lao", "lt": "Lithuanian", "lv": "Latvian",
+    "mg": "Malagasy", "mk": "Macedonian", "ml": "Malayalam", "mn": "Cyrillic Mongolian", "mr": "Marathi", "ms": "Malay",
+    "mt": "Maltese", "my": "Burmese", "ne": "Nepali", "nl": "Dutch", "nn": "Norwegian Nynorsk", "no": "Norwegian",
+    "pa": "Punjabi", "pl": "Polish", "ps": "Pashto", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian",
+    "sa": "Sanskrit", "sd": "Sindhi", "si": "Sinhala", "sk": "Slovak", "sl": "Slovenian", "so": "Somali", "sq": "Albanian",
+    "sr": "Serbian", "su": "Sundanese", "sv": "Swedish", "sw": "Swahili", "ta": "Tamil", "te": "Telugu", "tg": "Tajik",
+    "th": "Thai", "tk": "Turkmen", "tl": "Filipino", "tr": "Turkish", "tt": "Tatar", "uk": "Ukrainian", "ur": "Urdu",
+    "uz": "Uzbek", "vi": "Vietnamese", "yi": "Yiddish", "yue": "Cantonese", "zh": "Chinese", "zh-TW": "Traditional Chinese",
+}
+# Hy-MT3 has one Portuguese (as NLLB has); whisper_code("zho_Hant") is zh (Whisper has one Chinese), hence zhohant here.
+HY_VARIANTS = {"traditionalchinese": "zh-TW", "zhhant": "zh-TW", "zhtw": "zh-TW", "zhohant": "zh-TW", "zhhans": "zh",
+               "zhcn": "zh", "zhohans": "zh", "brazilianportuguese": "pt", "europeanportuguese": "pt", "ptbr": "pt",
+               "ptpt": "pt", "filipino": "tl", "fil": "tl"}
+# The targets of at most 3 tokens per English token (measured on one sentence in 12 languages: German 1.6, Russian 1.8,
+# Ukrainian 2.5, Arabic 2.6, Chinese 0.9, Japanese 1.8, Korean 2.1; the others of the same scripts by inference); every
+# other target gets 9 (measured: Burmese 8.1, Hindi 4.5, Thai 3.5).
+HY_DENSE_OK = frozenset("en de fr es it pt nl ca gl eu af lb mt cy sq ro hu cs sk sl hr sr bs pl lt lv et fi sv da no nn is "
+                        "tr az uz tk id ms tl jw su vi sw so mg ht ru uk be bg mk kk mn tg tt ba el ar fa ur ps sd yi he "
+                        "zh zh-TW yue ja ko".split())
+HY_NO_SPACES = frozenset("zh zh-TW yue ja th lo km my".split())     # written without spaces between sentences (NO_SPACES)
+HY_PIECE = 1500       # characters per request: about 350 English tokens, which with 9 times that as output fit its 8K context
+
+
+def hy_code(name):
+    """'Russian', 'ru', 'Kazakh', 'Brazilian Portuguese', 'Traditional Chinese', 'zho_Hant' -> the code of HY_NAMES ('ru',
+    'kk', 'pt', 'zh-TW'); None for a language Hy-MT3 does not support (Yoruba, Bosnian) or one Whisper does not know."""
+    key = re.sub("[^a-z]", "", (name or "").strip().lower())
+    if key in HY_VARIANTS:
+        return HY_VARIANTS[key]
+    code = whisper_code(name)
+    return code if code in HY_NAMES else None
+
+
+def hy_pair(lang, target, source=None):
+    """(source code, target code) when Hy-MT3 takes a line in `lang` (or `source` for an untagged one) into `target`,
+    else None."""
+    src, tgt = hy_code(lang or source), hy_code(target)
+    return (src, tgt) if src and tgt else None
+
+
+def hy_prompt(text, tgt):
+    """The model card's plain "Default Translation" prompt in English, with the target's English name; it names no source
+    language, and the model has no system prompt."""
+    return (f"Translate the following text into {HY_NAMES[tgt]}. Note that you should only output the translated result "
+            f"without any additional explanation:\n\n{text}")
+
+
+def hy_budget(n_src, tgt):
+    """max_tokens for a piece of n_src tokens into tgt: room for the target's script (measured: Burmese 8.1x English, Hindi
+    4.5x, Thai 3.5x, Arabic 2.6x, Ukrainian 2.5x), capped at the card's 4096."""
+    return min(4096, 64 + (3 if tgt in HY_DENSE_OK else 9) * n_src)
+
+
+def hy_present():
+    """Whether every one of HY_FILES is in the Hugging Face cache at its commit (nothing is downloaded). Looked up file by
+    file: snapshot_download(local_files_only=True) gives the snapshot folder without looking at the files in it."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        return all(isinstance(try_to_load_from_cache(repo, name, revision=commit), str) for repo, commit, name, _, _ in HY_FILES)
+    except Exception:
+        return False
+
+
+def fetch_hy(stage=True, refetch=True):
+    """{file: path} of HY_FILES in the Hugging Face cache, each one downloaded when it is missing and checked against its
+    size and SHA-256 (huggingface_hub checks neither). `stage` as in fetch_model; `refetch` as in _check_hy_file."""
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+
+    cached = {name: try_to_load_from_cache(repo, name, revision=commit) for repo, commit, name, _, _ in HY_FILES}
+    if not all(isinstance(path, str) for path in cached.values()):
+        text = "Downloading the translation model Hy-MT3 7B (first time only, about 4.2 GB)"
+        ev("STAGE", text) if EVENTS and stage else print(text, file=sys.stderr)
+    paths = {}
+    for repo, commit, name, size, sha256 in HY_FILES:
+        path = cached[name] if isinstance(cached[name], str) else hf_hub_download(repo, name, revision=commit)
+        paths[name] = _check_hy_file(repo, commit, name, size, sha256, path, stage, refetch)
+    return paths
+
+
+_HY_REFETCHED = set()     # (repo, name) of the files downloaded again in this run: a second mismatch is not fetched a third time
+
+
+def _check_hy_file(repo, commit, name, size, sha256, path, stage=True, refetch=True):
+    """`path` when its size and SHA-256 are the pinned ones; otherwise it is downloaded once more (once per run) and
+    checked again, and an error tells what to delete when it still does not match. Without `refetch` (the live worker's
+    thread, where a 4.2 GB download would hold up the live transcript) a mismatch is an error at once: the live
+    translation is off and the final pass, off that thread, downloads the file again."""
+    from huggingface_hub import hf_hub_download
+
+    got = _hy_digest(path, size, sha256, stage)
+    if got != sha256 and not refetch:
+        raise RuntimeError(f"The Hy-MT3 file {name} from {repo} does not match its checksum; it is downloaded again when "
+                           "the recording is translated at the end")
+    if got != sha256 and (repo, name) not in _HY_REFETCHED:
+        _HY_REFETCHED.add((repo, name))
+        print(f"The Hy-MT3 file {name} from {repo} does not match its checksum; downloading it again", file=sys.stderr)
+        path = hf_hub_download(repo, name, revision=commit, force_download=True)
+        got = _hy_digest(path, size, sha256, stage)
+    if got != sha256:
+        raise RuntimeError(f"The Hy-MT3 file {name} from {repo} does not match its checksum (expected {sha256}, got {got}). "
+                           f"Delete the folder ~/.cache/huggingface/hub/models--{repo.replace('/', '--')} and translate "
+                           "again, or choose another offline model.")
+    return path
+
+
+def _hy_digest(path, size, sha256, stage=True):
+    """The SHA-256 of a file (or the size it has, when that is not `size`). The 4.2 GB file is hashed once: after it
+    matched, its path, size and modification time are recorded in MODELS_DIR, and a file that still has them is not read
+    again; the small files (17 MB) are hashed at every load."""
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    if st.st_size != size:
+        return f"a file of {st.st_size} bytes instead of {size}"
+    big = size > 2**26
+    record = MODELS_DIR / HY_CHECKED
+    checked = {}
+    if big:
+        try:
+            checked = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            checked = {}
+        if checked.get(real) == [st.st_size, st.st_mtime_ns, sha256]:
+            return sha256
+        text = "Checking the downloaded translation model (once)"
+        ev("STAGE", text) if EVENTS and stage else print(text, file=sys.stderr)
+    h = hashlib.sha256()
+    with open(real, "rb") as f:
+        for block in iter(lambda: f.read(2**24), b""):
+            h.update(block)
+    got = h.hexdigest()
+    if big and got == sha256:
+        try:
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            checked[real] = [st.st_size, st.st_mtime_ns, sha256]
+            record.write_text(json.dumps(checked), encoding="utf-8")
+        except OSError:
+            pass                                     # not recorded: it is hashed again next time, nothing worse
+    return got
+
+
+def get_hy(keep_engine=False):
+    """Hy-MT3 and its tokenizer (downloaded once, about 4.2 GB). The speech model is let go first, unless keep_engine (a
+    live translation: both stay loaded, about 6 GB together, an estimate)."""
+    if not keep_engine:
+        release_engine()
+    return _load_hy()
+
+
+@functools.lru_cache(maxsize=1)
+def _load_hy():
+    if HY == HY_DEFAULT:
+        from mlx_lm.utils import load_model, load_tokenizer
+
+        # Downloaded (a stage of the job) only when a file is missing; a recording's live worker has fetched them already,
+        # so there it is only the check, which says nothing unless the big file was never checked.
+        files = fetch_hy(stage=not hy_present())
+        model, config = load_model(Path(files["model.safetensors"]).parent)
+        tok = load_tokenizer(Path(files["tokenizer.json"]).parent, eos_token_ids=config.get("eos_token_id"))
+    else:
+        from mlx_lm import load
+
+        folder = Path(HY).expanduser()
+        if not folder.is_dir() and not model_present(HY):
+            text = f"Downloading the translation model {HY} (first time only)"
+            ev("STAGE", text) if EVENTS else print(text, file=sys.stderr)
+        try:
+            model, tok = load(str(folder) if folder.is_dir() else HY)
+        except ValueError as e:
+            if "TokenizersBackend" not in str(e):
+                raise
+            raise RuntimeError(f"{HY}: its tokenizer_config.json needs transformers 5 ('TokenizersBackend'); put Tencent's "
+                               "tokenizer_config.json (https://huggingface.co/tencent/Hy-MT3-7B/blob/main/tokenizer_config.json) "
+                               "in its place, or unset MT_HY_MODEL") from e
+    # The answer ends with <|eos|>. Tencent's own config.json names only that one (a copy converted from it too), the
+    # generation config also <|extra_5|>: both stop the generation, the second when the vocabulary has it.
+    tok.add_eos_token("<|eos|>")
+    extra = tok.convert_tokens_to_ids("<|extra_5|>")
+    if isinstance(extra, int) and extra != getattr(tok, "unk_token_id", None):
+        tok.add_eos_token("<|extra_5|>")
+    return model, tok
+
+
+def release_hy():
+    import gc
+    clear = getattr(_load_hy, "cache_clear", None)
+    if clear:
+        clear()
+    gc.collect()
+
+
+def hy_translate(items, tgt, keep_engine=False):
+    """(texts, cut): the texts of `items` ((source code, text) pairs, codes from hy_code) in `tgt`, one request per text
+    (a long text in pieces of whole sentences), and how many of them had a piece that ran to its token limit (kept: it is
+    the best there is). Greedy, with the card's repetition penalty (1.05 over the last 20 tokens) and not its sampling: the
+    same line always gives the same text, live, at the end and in a rerun (in a 10-line test meant to provoke loops no
+    setting looped, and sampling changed half the lines from run to run). mlx-lm's penalty window holds the last prompt
+    token and the reply, not the source text, so a name or a number copied from it is not penalised."""
+    from mlx_lm import stream_generate
+    from mlx_lm.sample_utils import make_logits_processors
+
+    model, tok = get_hy(keep_engine)
+    _thread_stream()
+    decoding = dict(logits_processors=make_logits_processors(repetition_penalty=1.05, repetition_context_size=20))
+    out, cut = [], 0
+    for src, text in items:
+        done, short = [], False
+        for p in _pieces(text, HY_PIECE):
+            ids = tok.apply_chat_template([{"role": "user", "content": hy_prompt(p, tgt)}], add_generation_prompt=True)
+            budget = hy_budget(len(tok.encode(p, add_special_tokens=False)), tgt)
+            reply, finish = "", None
+            for r in stream_generate(model, tok, prompt=ids, max_tokens=budget, **decoding):
+                reply += r.text
+                finish = r.finish_reason
+            short = short or finish == "length"
+            done.append(reply.split("<|eos|>")[0].strip() or p)
+        cut += short
+        out.append(("" if tgt in HY_NO_SPACES else " ").join(done))
+    return out, cut
+
+
+def _pieces(text, limit):
+    """A text in pieces of at most `limit` characters, of whole sentences where it can (a longer sentence at words): one
+    request each to TranslateGemma or Hy-MT3."""
+    if len(text) <= limit:
         return [text]
     units = []
     for sentence in sentences(text):
         sentence = sentence.strip()
-        while len(sentence) > GEMMA_PIECE:           # one sentence too long for a request: cut at the last space before the limit
-            cut = sentence.rfind(" ", 0, GEMMA_PIECE)
-            cut = cut if cut > 0 else GEMMA_PIECE
+        while len(sentence) > limit:                 # one sentence too long for a request: cut at the last space before the limit
+            cut = sentence.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
             units.append(sentence[:cut].strip())
             sentence = sentence[cut:].strip()
         if sentence:
             units.append(sentence)
     pieces, piece = [], ""
     for unit in units:
-        if piece and len(piece) + 1 + len(unit) > GEMMA_PIECE:
+        if piece and len(piece) + 1 + len(unit) > limit:
             pieces.append(piece)
             piece = ""
         piece = f"{piece} {unit}" if piece else unit
@@ -3078,7 +3688,7 @@ def gemma_translate(items, tgt, keep_engine=False):
     out = []
     for src, text in items:
         done = []
-        for p in _gemma_pieces(text):
+        for p in _pieces(text, GEMMA_PIECE):
             msgs = [{"role": "user", "content": [{"type": "text", "source_lang_code": src, "target_lang_code": tgt, "text": p}]}]
             ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
             reply = generate(model, tok, prompt=ids, max_tokens=min(2048, 2 * len(ids) + 64))
@@ -3102,17 +3712,71 @@ def same_language(src, tgt):
     return src.split("-")[0] == tgt.split("-")[0] and src.split("-")[0] != "zh"
 
 
-def offline_model():
-    """The model offline translation uses: NLLB, or with --translator gemma TranslateGemma."""
-    return GEMMA if TRANSLATOR == "gemma" else NLLB
+# TranslateGemma and Hy-MT3 go the same ways (a line each, the rest to NLLB, a log, the live pass); these say which of the
+# two the run has chosen. They read TRANSLATOR when called (--translator sets it in main(), the tests with monkeypatch).
+LLMS = ("gemma", "hy")       # the offline translators that run on the Apple GPU through mlx-lm
+
+
+def llm_on():
+    return TRANSLATOR in LLMS
+
+
+def llm_repo():
+    return HY if TRANSLATOR == "hy" else GEMMA
+
+
+def llm_label():
+    return "Hy-MT3" if TRANSLATOR == "hy" else "TranslateGemma"
+
+
+def llm_outside():
+    """The words for a line the model does not take ("1 in a language … go to NLLB")."""
+    return "Hy-MT3 does not support" if TRANSLATOR == "hy" else "TranslateGemma was not evaluated on"
+
+
+def llm_size():
+    return "about 4.2 GB" if TRANSLATOR == "hy" else "about 7 GB"
+
+
+def llm_code(name):
+    return hy_code(name) if TRANSLATOR == "hy" else gemma_code(name)
+
+
+def llm_pair(lang, target, source=None):
+    return hy_pair(lang, target, source) if TRANSLATOR == "hy" else gemma_pair(lang, target, source)
+
+
+def llm_model_name():
+    """The model's name in a log's file name: a local folder (MT_HY_MODEL) by its own name and 8 characters of its full
+    path's hash, as the full path could make the file name longer than a file system allows, and two folders of the same
+    name (a 4-bit and an 8-bit copy) must not reuse each other's lines."""
+    folder = Path(HY).expanduser()
+    if TRANSLATOR == "hy" and folder.is_dir():
+        return f"{folder.name}-{hashlib.sha1(str(folder.resolve()).encode('utf-8')).hexdigest()[:8]}"
+    return llm_repo()
+
+
+def get_llm(keep_engine=False):
+    return get_hy(keep_engine) if TRANSLATOR == "hy" else get_gemma(keep_engine)
+
+
+def release_llm():
+    release_hy() if TRANSLATOR == "hy" else release_gemma()
+
+
+def llm_translate(items, tgt, keep_engine=False):
+    """(texts, cut) as hy_translate, with the chosen model (TranslateGemma's replies are never counted as cut)."""
+    if TRANSLATOR == "hy":
+        return hy_translate(items, tgt, keep_engine)
+    return gemma_translate(items, tgt, keep_engine), 0
 
 
 def line_translator(lang, target, offline, source=None):
-    """Which model translates a line into `target`: "claude", NLLB or TranslateGemma (which gives a line it was not
-    evaluated on to NLLB). A live translation is reused at the end only when the same model made it."""
+    """Which model translates a line into `target`: "claude", NLLB, TranslateGemma or Hy-MT3 (which give a line outside
+    their languages to NLLB). A live translation is reused at the end only when the same model made it."""
     if not offline:
         return "claude"
-    return GEMMA if TRANSLATOR == "gemma" and gemma_pair(lang, target, source) else NLLB
+    return llm_repo() if llm_on() and llm_pair(lang, target, source) else NLLB
 
 
 SENTENCE_END =re.compile(r"(?<=[.!?\u2026])\s+|(?<=[\u3002\uff01\uff1f])")      # . ! ? ... and CJK 。！？
@@ -3165,7 +3829,7 @@ def _translation_log(checkpoint, tgt, lines):
 
 
 def translation_log_name(tgt, model, digest):
-    """The file name of a translation's log in the data folder's translations\\ (NLLB's and TranslateGemma's)."""
+    """The file name of a translation's log in the data folder's translations\\ (NLLB's, TranslateGemma's, Hy-MT3's)."""
     return f"{tgt}-{model.replace('/', '_')}-{digest}.jsonl"
 
 
@@ -3173,8 +3837,8 @@ def translate_offline(doc, target, source=None, checkpoint=None, live=None, done
     """Translate every line with the local model. A line is read as the language it is tagged with (source for
     untagged lines); lines already in the target language, or of an unknown language, stay as they are. With a checkpoint
     folder every finished batch is written down, so a run cut short goes on where it stopped. `live` holds the lines
-    translated already ({line index: text}, live, or by TranslateGemma: `done_label` says which in the note): they are
-    taken as they are, and the model is loaded only when a line is left for it."""
+    translated already ({line index: text}, live, or by TranslateGemma or Hy-MT3: `done_label` says which in the note):
+    they are taken as they are, and the model is loaded only when a line is left for it."""
     tgt = nllb_code(target)
     lines = doc["lines"]
     live = live or {}
@@ -3310,8 +3974,9 @@ def claude_translate(client, target, texts):
 
 def translated_live(lines, target, offline, source=None):
     """{line index: text} of the lines a live run translated into `target` with the model the final pass would use for
-    them (`tr_by`: Claude, NLLB or TranslateGemma; before 1.10.0's TranslateGemma, `tr_offline` alone) and whose text
-    is still the one translated (`tr_of`): a line the final pass changed (echo trimmed, decoded again) is translated anew."""
+    them (`tr_by`: Claude, NLLB, TranslateGemma or Hy-MT3; before 1.10.0's TranslateGemma, `tr_offline` alone) and whose
+    text is still the one translated (`tr_of`): a line the final pass changed (echo trimmed, decoded again) is translated
+    anew."""
     def made_by(l):
         return (l.get("tr_by") or {}).get(target) or (NLLB if l.get("tr_offline") else "claude")
     return {i: l["tr"][target] for i, l in enumerate(lines)
@@ -3319,27 +3984,27 @@ def translated_live(lines, target, offline, source=None):
             and made_by(l) == line_translator(l.get("lang"), target, offline, source)}
 
 
-def _gemma_log(checkpoint, tgt, lines):
-    """Where TranslateGemma's lines are kept as they are made (a rerun after a crash reuses them), or None."""
+def _llm_log(checkpoint, tgt, lines):
+    """Where TranslateGemma's or Hy-MT3's lines are kept as they are made (a rerun after a crash reuses them), or None."""
     if not checkpoint:
         return None
     digest = hashlib.sha1(json.dumps([[l.get("lang"), l.get("text")] for l in lines], ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
     folder = Path(checkpoint) / "translations"
     folder.mkdir(parents=True, exist_ok=True)
-    return folder / translation_log_name(tgt, GEMMA, digest)
+    return folder / translation_log_name(tgt, llm_model_name(), digest)
 
 
-def translate_gemma_doc(doc, target, source=None, checkpoint=None, live=None):
-    """Every line with TranslateGemma, one line per request; a line already in the target stays as it is; a line of a
-    language it was not evaluated on (or untagged without --from) goes to NLLB, which the note counts. With a checkpoint
-    folder each translated line is written down, so a run cut short goes on where it stopped. `live` holds the lines
-    TranslateGemma translated live ({line index: text})."""
+def translate_llm_doc(doc, target, source=None, checkpoint=None, live=None):
+    """Every line with TranslateGemma or Hy-MT3 (the chosen one), one line per request; a line already in the target
+    stays as it is; a line of a language outside the model's (or untagged without --from) goes to NLLB, which the note
+    counts. With a checkpoint folder each translated line is written down, so a run cut short goes on where it stopped.
+    `live` holds the lines the model translated live ({line index: text})."""
     lines, live = doc["lines"], dict(live or {})
-    tgt = gemma_code(target)
-    if not tgt:                                       # a target TranslateGemma was not evaluated on: all of it is NLLB's
-        note(f"{target} is not among TranslateGemma's languages: NLLB translates it")
+    tgt = llm_code(target)
+    if not tgt:                                       # a target outside the model's languages: all of it is NLLB's
+        note(f"{target} is not among {llm_label()}'s languages: NLLB translates it")
         return translate_offline(doc, target, source, checkpoint, live=live) if live else translate_offline(doc, target, source, checkpoint)
-    log = _gemma_log(checkpoint, tgt, lines) if tgt else None
+    log = _llm_log(checkpoint, tgt, lines) if tgt else None
     earlier = {}
     if log and log.exists():
         for raw in log.read_text(encoding="utf-8").splitlines():
@@ -3352,7 +4017,7 @@ def translate_gemma_doc(doc, target, source=None, checkpoint=None, live=None):
     for i, l in enumerate(lines):
         if "text" not in l or i in done:
             continue
-        pair = gemma_pair(l.get("lang"), target, source)
+        pair = llm_pair(l.get("lang"), target, source)
         if not pair:
             continue                                  # NLLB's, below
         if same_language(*pair):
@@ -3364,15 +4029,17 @@ def translate_gemma_doc(doc, target, source=None, checkpoint=None, live=None):
         else:
             todo.append((i, pair[0]))
     if reused:
-        note(f"Going on from an earlier run: {reused} lines translated by TranslateGemma reused")
+        note(f"Going on from an earlier run: {reused} lines translated by {llm_label()} reused")
     if todo:
         release_engine()                              # once: the speech model is not needed any more
     handle = open(log, "a", encoding="utf-8") if log and todo else None
+    cut = 0                                           # lines with a piece that ran to the token limit (Hy-MT3)
     try:
         for k, (i, src) in enumerate(todo, 1):
             if EVENTS:
                 ev("PROG", k, len(todo))
-            done[i] = gemma_translate([(src, lines[i]["text"])], tgt, keep_engine=True)[0]
+            texts, n = llm_translate([(src, lines[i]["text"])], tgt, keep_engine=True)
+            done[i], cut = texts[0], cut + n
             if handle:
                 handle.write(json.dumps({"i": i, "text": done[i]}, ensure_ascii=False) + "\n")
                 handle.flush()
@@ -3381,17 +4048,21 @@ def translate_gemma_doc(doc, target, source=None, checkpoint=None, live=None):
             handle.close()
     spoken = sum(1 for l in lines if "text" in l)
     rest = spoken - len(done)
-    note(f"Translated {len(todo) + reused} line(s) into {target} with TranslateGemma"
-         + (f"; {len(live)} translated live" if live else "") + (f"; {same} already in {target}" if same else "")
-         + (f"; {rest} in a language TranslateGemma was not evaluated on go to NLLB" if rest else ""))
+    if rest and not (todo or reused or live or same):  # not "Translated 0 line(s) … with Hy-MT3"
+        note(f"None of the {rest} line(s) is in one of {llm_label()}'s languages: NLLB translates them into {target}")
+    else:
+        note(f"Translated {len(todo) + reused} line(s) into {target} with {llm_label()}"
+             + (f"; {len(live)} translated live" if live else "") + (f"; {same} already in {target}" if same else "")
+             + (f"; {rest} in a language {llm_outside()} go to NLLB" if rest else "")
+             + (f"; {cut} line(s) ran to the token limit and may be cut short or repeat" if cut else ""))
     if not rest:
         return [done.get(i, l.get("text")) for i, l in enumerate(lines)]
-    release_gemma()                                   # room for NLLB
+    release_llm()                                     # room for NLLB
     try:
         return translate_offline(doc, target, source, checkpoint, live=done,
-                                 done_label=f"done before (by TranslateGemma, live, or already in {target})")
-    except Exception as e:                            # NLLB not here (no network): TranslateGemma's lines are not lost
-        note(f"NLLB could not translate the {rest} line(s) TranslateGemma does not cover ({type(e).__name__}: {e}); they are "
+                                 done_label=f"done before (by {llm_label()}, live, or already in {target})")
+    except Exception as e:                            # NLLB not here (no network): the model's lines are not lost
+        note(f"NLLB could not translate the {rest} line(s) {llm_label()} does not cover ({type(e).__name__}: {e}); they are "
              f"kept in the original, and the translation is made again next time")
         doc.setdefault("_incomplete", set()).add(target)
         return [done.get(i, l.get("text")) for i, l in enumerate(lines)]
@@ -3400,16 +4071,16 @@ def translate_gemma_doc(doc, target, source=None, checkpoint=None, live=None):
 def translate(doc, target, offline=False, source=None, checkpoint=None):
     """The target's text for every line (None for a note), cached in the doc by language code and model. A line
     translated live (`tr` on the line, made the same way) is not translated again."""
-    if offline and TRANSLATOR == "gemma":
-        key = f"{gemma_code(target) or nllb_code(target) or target} [{GEMMA}]"
+    if offline and llm_on():
+        key = f"{llm_code(target) or nllb_code(target) or target} [{llm_repo()}]"
     else:
         key = f"{nllb_code(target) or target} [{NLLB}]" if offline else target
     cached = doc["translations"].get(key)
     if cached:
         return cached
     done = translated_live(doc["lines"], target, offline, source)
-    if offline and TRANSLATOR == "gemma":
-        out = translate_gemma_doc(doc, target, source, checkpoint, live=done)
+    if offline and llm_on():
+        out = translate_llm_doc(doc, target, source, checkpoint, live=done)
         if target not in (doc.pop("_incomplete", None) or ()):     # a part left in the original is not kept as done
             doc["translations"][key] = out
         return out
@@ -3484,7 +4155,7 @@ def _nllb_texts(lines, target, source=None):
     return out
 
 
-_NLLB_FAILED = []            # live: NLLB could not be loaded beside TranslateGemma once; not tried again for every chunk
+_NLLB_FAILED = []            # live: NLLB could not be loaded beside TranslateGemma or Hy-MT3 once; not tried again each chunk
 
 
 def translate_texts(lines, target, offline=False, source=None):
@@ -3492,28 +4163,31 @@ def translate_texts(lines, target, offline=False, source=None):
     line that got none: offline with the local model (a line already in the target stays as it is; one of a language
     the model does not have gets None, so the final pass counts it in its note), else one request to Claude (a line
     missing from the reply, or cut off at its end, gets None, so the final pass sends it again). With --translator
-    gemma, the lines TranslateGemma covers go to it and the others to NLLB."""
-    if offline and TRANSLATOR == "gemma":
+    gemma or hy, the lines that model covers go to it and the others to NLLB."""
+    if offline and llm_on():
         out = [None] * len(lines)
         todo, rest = [], []
         for i, l in enumerate(lines):
-            pair = gemma_pair(l.get("lang"), target, source)
+            pair = llm_pair(l.get("lang"), target, source)
             if not pair:
                 rest.append(i)
             elif same_language(*pair):
                 out[i] = l["text"]
             else:
                 todo.append((i, pair))
-        for (i, (src, tgt)), text in zip(todo, gemma_translate([(src, lines[i]["text"]) for i, (src, _) in todo],
-                                                                gemma_code(target), keep_engine=True) if todo else []):
+        texts, cut = llm_translate([(src, lines[i]["text"]) for i, (src, _) in todo], llm_code(target),
+                                   keep_engine=True) if todo else ([], 0)
+        for (i, _), text in zip(todo, texts):
             out[i] = text
-        if rest and not _NLLB_FAILED:                # the lines TranslateGemma was not evaluated on: NLLB, beside it
+        if cut:
+            print(f"{cut} line(s) ran to the token limit and may be cut short or repeat", file=sys.stderr)
+        if rest and not _NLLB_FAILED:                # the lines outside the model's languages: NLLB, beside it
             try:
                 for i, text in zip(rest, _nllb_texts([lines[i] for i in rest], target, source)):
                     out[i] = text
             except Exception as e:                   # NLLB not here (no network): those lines wait for the final pass
                 _NLLB_FAILED.append(e)
-                print(f"NLLB could not be loaded ({type(e).__name__}: {e}); the lines TranslateGemma does not cover are "
+                print(f"NLLB could not be loaded ({type(e).__name__}: {e}); the lines {llm_label()} does not cover are "
                       "translated at the end", file=sys.stderr)
         return out
     if offline:
@@ -3525,9 +4199,9 @@ def translate_texts(lines, target, offline=False, source=None):
 
 
 def translate_live(lines, targets, offline=False, source=None):
-    """Adds `tr` ({target: text}), `tr_of` (the text that was translated), `tr_by` (the model: "claude", NLLB or
-    TranslateGemma) and `tr_offline` to the spoken lines of one decoded chunk, one target after another; a line that got
-    no translation into a target has none for it."""
+    """Adds `tr` ({target: text}), `tr_of` (the text that was translated), `tr_by` (the model: "claude", NLLB,
+    TranslateGemma or Hy-MT3) and `tr_offline` to the spoken lines of one decoded chunk, one target after another; a
+    line that got no translation into a target has none for it."""
     spoken = [l for l in lines if "text" in l]
     if not spoken:
         return
@@ -3716,9 +4390,9 @@ def show(d, target, offline=False):
 def _need_key(targets, offline=False):
     """Fail at once, before a long transcription, when the translation cannot work."""
     global TRANSLATOR
-    if offline and targets and TRANSLATOR == "gemma" and not gemma_available():
+    if offline and targets and llm_on() and not mlx_lm_available():
         # A recording must not be refused over the translation: NLLB translates instead, and the note says why.
-        note("TranslateGemma is not available here (it needs Apple silicon and the mlx-lm package: pip install -r "
+        note(f"{llm_label()} is not available here (it needs Apple silicon and the mlx-lm package: pip install -r "
              "requirements-mlx.txt, or in the app Set Up Speech Engine Again… if its Apple-GPU step failed); NLLB translates instead")
         TRANSLATOR = "nllb"
     if offline:
@@ -3820,7 +4494,7 @@ def windows_path_problem(folder, targets, offline, stem=None):
     files = []
     if offline and targets:                          # zho_Hant: every NLLB code has 8 characters
         files += [folder / "translations" / translation_log_name("zho_Hant", model, "0" * 16)
-                  for model in ((NLLB, GEMMA) if TRANSLATOR == "gemma" else (NLLB,))]
+                  for model in ((NLLB, llm_model_name()) if llm_on() else (NLLB,))]
     if stem:
         files += [folder / f"{stem}.transcript.txt"] + [folder / translation_file_name(stem, t) for t in targets]
     longest = max(files, key=lambda p: utf16_len(str(p)), default=None)
@@ -3996,19 +4670,25 @@ def preflight(hours=0.0, tracks=1, offline_targets=(), fetch=True):
             sys.exit(f"Not enough free disk for {_limit_text(int(hours * 3600))} of recording: {need // 2**20} MB are needed "
                      f"(twice that to be safe), {free // 2**20} MB are free. Nothing was started.")
     if offline_targets:
-        # TranslateGemma when a target is one of its languages, and NLLB in every case: with TranslateGemma it takes the
-        # lines of a language TranslateGemma lacks, which Whisper may tag in any meeting. A recording does not wait for
+        # TranslateGemma or Hy-MT3 when a target is one of its languages, and NLLB in every case: beside either it takes
+        # the lines of a language that model lacks, which Whisper may tag in any meeting. A recording does not wait for
         # them (fetch=False): its live worker fetches them beside the work, and its transcription before translating.
         for model, size in (translation_models(offline_targets, True) if fetch else []):
             try:
                 fetch_model(model, size)
             except Exception as e:                   # no internet: the transcript must not be lost over the translation
-                print(f"The translation model could not be fetched now ({type(e).__name__}); it is tried again when the "
+                why = f"{type(e).__name__}: {e}" if isinstance(e, RuntimeError) else type(e).__name__   # our own advice
+                print(f"The translation model could not be fetched now ({why}); it is tried again when the "
                       "translation starts, and the transcript is written first either way", file=sys.stderr)
     total = total_memory()
     if total and total < 16 * 2**30 and offline_targets and TRANSLATOR == "gemma":
         print(f"This computer has {total // 2**30} GB of memory: TranslateGemma needs about 7 GB (8.5 GB beside the speech "
               "model while recording); with less than 16 GB the Mac may slow down, and --translator nllb needs 1.4 GB", file=sys.stderr)
+    # 12 GB for Hy-MT3: about 6 GB with the speech model is three quarters of an 8 GB Mac and well inside 16 GB (estimates).
+    if total and total < 12 * 2**30 and offline_targets and TRANSLATOR == "hy":
+        print(f"This computer has {total // 2**30} GB of memory: Hy-MT3 needs about 4.5 GB (about 6 GB beside the speech model "
+              "while recording; estimates); with less than 12 GB the Mac may slow down, and --translator nllb needs 1.4 GB",
+              file=sys.stderr)
     if total and total < 12 * 2**30 and hours >= 2:
         # Advice about the machine, not about the recording: a plain line (the app's log), not a note, which the app would
         # put at the top of the transcript with the recording's own notes.
@@ -4069,9 +4749,11 @@ def main():
                     help="a note to put at the top of the transcript (repeatable): what the app knows about the recording")
     offline = dict(action="store_true", help="translate on this computer instead of with Claude (no API key; "
                    "the first time it downloads a 1.4 GB model; quality is below Claude's)")
-    translator_arg = dict(choices=["nllb", "gemma"], default=None,
-                          help="the offline translator: nllb (default; 1.4 GB, about 200 languages, CPU) or gemma "
-                               "(TranslateGemma 12B: Apple silicon and mlx-lm, 7 GB, 51 languages, other lines go to nllb)")
+    translator_arg = dict(choices=["nllb", "gemma", "hy"], default=None,
+                          help="the offline translator: nllb (default; 1.4 GB, about 200 languages, CPU), gemma "
+                               "(TranslateGemma 12B: Apple silicon and mlx-lm, 7 GB, 51 languages) or hy (Hy-MT3 7B: "
+                               "Apple silicon and mlx-lm, 4.2 GB, 102 languages); lines outside gemma's or hy's languages "
+                               "go to nllb")
     r = sub.add_parser("record", help="record from the microphone, then transcribe")
     r.add_argument("--name", help="a short name for the recording (becomes part of the folder and file names)")
     r.add_argument("--hours", type=float, default=4, help=f"stop by itself after this much recorded audio (default 4, at most {MAX_HOURS}; "
@@ -4089,7 +4771,8 @@ def main():
                         "pyannote (optional, better, slower; pip install -r requirements-pyannote.txt and a Hugging Face token in HF_TOKEN)")
     r.add_argument("--speakers", **speakers_arg)
     r.add_argument("--diarizer", **diarizer_arg)
-    r.add_argument("--no-transcribe", action="store_true", help="only record; transcribe later (transcribe <folder>/audio.wav or call <folder>/mic.wav <folder>/system.wav)")
+    r.add_argument("--no-transcribe", action="store_true", help="only record; transcribe later (transcribe <folder>/audio.wav "
+                   "--into <folder>, or call <folder>/mic.wav <folder>/system.wav --into <folder>)")
     r.add_argument("--system-device", metavar="DEVICE", help="a second input that carries what the computer plays (the other "
                    "side of a call): a monitor source on Linux, BlackHole or similar on macOS, Stereo Mix on Windows; "
                    "an index, an exact name or a part of a name that fits one device only (see: devices); "

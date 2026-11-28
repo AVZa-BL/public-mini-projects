@@ -811,6 +811,9 @@ final class Runner: ObservableObject {
         p.executableURL = URL(fileURLWithPath: step.executable)
         p.arguments = step.arguments
         var env = ProcessInfo.processInfo.environment
+        // The window's offline model is passed as --translator (NLLB, mt.py's default, as nothing): an MT_TRANSLATOR
+        // inherited from a shell or launchctl would otherwise override a choice of NLLB.
+        env.removeValue(forKey: "MT_TRANSLATOR")
         for (k, v) in step.environment { env[k] = v }
         // Apps started from the Finder get a short PATH; ffmpeg lives in Homebrew's folders.
         env["PATH"] = Engine.extraPath

@@ -1,8 +1,12 @@
 # The Apple-GPU parts (optional): Apple silicon, macOS 14 or newer, Python 3.10 or newer.
 # mlx-whisper: the speech model on the GPU (MT_ENGINE=auto takes it when installed).
 mlx-whisper>=0.4
-# mlx-lm: TranslateGemma 12B, the second offline translator (--translator gemma); 0.29.1 is the version it was tested
-# with on a Mac (stream_generate, TokenizerWrapper.add_eos_token).
+# mlx-lm: TranslateGemma 12B and Hy-MT3 7B, the offline translators on the Apple GPU (--translator gemma, --translator hy);
+# 0.29.1 is the version both were tested with (stream_generate, TokenizerWrapper.add_eos_token; models/hunyuan_v1_dense.py
+# for Hy-MT3). For Hy-MT3 "tested" means so far on a Linux CPU (MLX 0.32.5): its tokenizer, the names and shapes of its
+# weights, and six lines translated through mt.py (one by `mt.py translate`), each ended at its end token; not yet on a Mac.
 mlx-lm==0.29.1
 # The transformers version that test ran with: mlx-lm 0.29.1 sets no upper bound, and transformers 5 is untested here.
+# Hy-MT3's tokenizer is taken from Tencent's repository because the community MLX copy's tokenizer_config.json needs
+# transformers 5.
 transformers==4.57.6

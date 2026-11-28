@@ -17,7 +17,7 @@ Use the **Mac app**, a terminal, or a Claude Code session in this folder (the in
 | Speech → text, language per ~30 s speech chunk | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (Whisper `large-v3-turbo`, ~99 languages) on the CPU; on Apple silicon [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) on the GPU (`MT_ENGINE=auto`, the default, picks it when installed) | locally, offline after the first model download |
 | Who spoke (`--speakers`) | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker diarization: pyannote segmentation 3.0 + 3D-Speaker ERes2Net embeddings (47 MB, fetched at setup); optionally [pyannote.audio](https://github.com/pyannote/pyannote-audio) | locally |
 | Translation (default) | Claude API | needs `ANTHROPIC_API_KEY` and internet |
-| Translation (`--offline`) | NLLB-200 (Meta) on CTranslate2 | locally; downloads a 1.4 GB model once, then no internet and no key |
+| Translation (`--offline`) | NLLB-200 (Meta) on CTranslate2; on Apple silicon also Hy-MT3 7B (Tencent) or TranslateGemma 12B (Google) through mlx-lm | locally; downloads the model once (1.4 GB, 4.2 GB or 7 GB), then no internet and no key |
 
 Claude itself does not take audio input, so a speech model does the transcription; translation is Claude's, or the local model's when you choose offline.
 
@@ -32,7 +32,7 @@ what is chosen (the first three, then "+n"), and its list has a search field, th
 A–Z, with the chosen ones ticked and highlighted; it stays open while several are picked (*Clear*, *Done*). The spoken list has
 every language Whisper recognises (100). The translation list, offline, has the 101 languages `mt.py` knows by name for the
 offline models: Whisper's without Breton, Hawaiian and Latin, plus Traditional Chinese, Zulu, and Brazilian and European
-Portuguese, which TranslateGemma keeps apart. With Claude (*Translate offline* unticked) Breton, Hawaiian and Latin are offered
+Portuguese, which TranslateGemma keeps apart (Hy-MT3 and NLLB translate both as Portuguese). With Claude (*Translate offline* unticked) Breton, Hawaiian and Latin are offered
 too. Each name is one `mt.py` accepts (`tests/test_mt.py` checks every one against `whisper_code` and `nllb_code`). The *Others*
 text fields are gone: languages typed there in an earlier version are added to the choice once, at the first launch. Other NLLB
 languages, by their code (`ibo_Latn`), and any language for Claude remain available on the command line (`--to`).
@@ -51,7 +51,8 @@ Add `--arch arm64` for Apple silicon only (faster). CI also builds it: open the 
 the Whisper model and, when the Mac has no ffmpeg, ffmpeg and ffprobe (about 2 GB in all, a few minutes; internet is needed only
 for this). Nothing else has to be installed: no Python, no Homebrew, no Command Line Tools. The ffmpeg binaries come from the
 `static-ffmpeg` package (GPL builds of [FFmpeg](https://ffmpeg.org)); a Homebrew ffmpeg is used when present. For translation with Claude press **Set Key…** and paste your API key (kept in the Keychain; if macOS refuses it, the window says so and keeps it in a file only you can read, `~/Library/Application Support/Meeting Transcriber/api-key`), or keep **Translate offline on this Mac** ticked (the default: nothing leaves the Mac; untick it to translate with Claude)
-(no key; see *Offline translation* below).
+(no key; see *Offline translation* below). On Apple silicon the offline model is Hy-MT3 7B unless you chose another (*Offline
+model*); on an Intel Mac it is NLLB.
 **Output folder.** Every meeting's files go to the folder chosen under *Output folder* (default `~/Documents/Meeting Transcriber`),
 into a subfolder named after the hour the meeting began, `yy-mm-dd hh` (`26-11-22 14`): the transcript (`<name>.transcript.txt`),
 one file per translation (`<name>.<Language>.txt`) and the recording itself (`<name>.wav`, or a call's `<name>.mic.wav` and
@@ -423,8 +424,9 @@ For an online call two things are recorded at once, as **two tracks**: your micr
   timestamps stay right.
 - **Cancel** while recording keeps the two audio files in the data folder and transcribes nothing; Stop transcribes them.
 - **Transcribe afterwards** (the app) or `--no-transcribe` (the command line) only records: the folder is shown as the result and the
-  files can be transcribed later. A recording stops by itself after the chosen hours of recorded audio (4 by default, up to 8), with a
-  notice 10 minutes before; **Extend by 1 h** (or `kill -USR1 <pid>` for the command line) moves the limit.
+  files can be transcribed later (`transcribe <folder>/audio.wav --into <folder>`, or `call <folder>/mic.wav <folder>/system.wav
+  --into <folder>`, so they are screened as a recording). A recording stops by itself after the chosen hours of recorded audio (4 by
+  default, up to 8), with a notice 10 minutes before; **Extend by 1 h** (or `kill -USR1 <pid>` for the command line) moves the limit.
 - **Pause** / **Resume** (or `kill -USR2 <pid>` for the command line): nothing is recorded while paused, the timer and the limit stand
   still, the recording and its transcript leave the pause out, and a timed note says where it was and for how long (`# [00:12:30]
   Paused here for 3 min 5 s`). Stop while paused ends the recording there.
@@ -569,12 +571,41 @@ guess: a language outside your list that Whisper was sure of, or a low confidenc
 noise it writes the credits of those subtitles: "Субтитры сделал DimaTorzok", "Редактор субтитров А.Синецкая Корректор
 А.Егорова", "Subtitles by the Amara.org community", "Untertitel im Auftrag des ZDF" (openai/whisper discussions 928 and 1873;
 Barański et al. 2025). Its own no-speech score does not catch them (about 0 on large-v3-turbo, SYSTRAN/faster-whisper#1128).
-`mt.py` drops a line that is nothing but such a credit, in any language, and cuts one off the start or end of a real line; an
-outro a real video says too ("Thanks for watching", "Продолжение следует") is dropped only when it stands alone in its stretch of
-audio spread over three seconds or more of near-silence, or when it comes three times or more on one track; short thanks
-("Спасибо.", "Thank you.") are never dropped. Such lines are never shown, translated or written, and one note at the end of the
-track says how many were left out. The patterns (82, collected from those reports and from other projects' filters) are in
-`mt.py` above `segment_lines`, and the tests check them against real sentences that must stay.
+`mt.py` drops a line that is nothing but such a credit or a sound caption ("[Music]", "♪♪", "♪ Musik ♪"), in any language,
+and cuts one off the start or end of a real line; a meeting's outro left in front of it is screened again on its own
+("Спасибо за внимание. Субтитры сделал DimaTorzok" at speaking speed keeps "Спасибо за внимание."). A German broadcaster
+named after "Untertitel" or "Untertitelung" with "des" or "der" or a year ("Untertitel der ARD.", "Untertitelung des ZDF,
+2020") is such a credit in any file, so a real "Untertitel der ARD." is lost too; "Untertitel für ARD und ZDF." and
+"Untertitel vom ZDF." stay. A question is never a sound caption, a broadcaster's credit or a video's phrase ("Music
+playing?", "SWR 2021?", "Untertitel des ZDF?", "Thanks for watching?", "Субтитры сделал Иван?"), and sung words between ♪
+stay ("♪ Happy birthday ♪"; only one word, or two with a music word, is a caption). Since 1.11.4, in a recording or a call (and in the app's queued transcription
+of one, `transcribe <folder>/audio.wav --into <folder>`), the phrases of a published video are dropped by their text too:
+"Thanks for watching", "Thank you for watching", "Danke fürs Zuschauen", "Продолжение следует", "Fortsetzung folgt",
+"Подпишитесь на мой канал", "Like and subscribe", "Ставьте лайки", "See you in the next video", a broadcaster's tag ("SWR
+2021", "ZDF, 2021"), and a subtitle credit naming any person ("Субтитры сделал Иван.") or thanking for the subtitles
+("Спасибо за субтитры"); one at the end of a real line is cut off ("Хорошо, договорились. Продолжение следует..." keeps
+"Хорошо, договорились."). So a real "Thank you for watching." at the end of a demo, a real "Продолжение следует." at the
+end of a topic, a real "Голосуем в чате. Ставьте лайки." (kept as "Голосуем в чате."), a real "Welcher Sender? ZDF, 2021."
+(kept as "Welcher Sender?"), or a video played through the computer's sound loses those lines or sentences; this is
+accepted to keep them out of the live window. A channel plug counts as a video's only for "my channel"
+("Abonnez-vous à ma chaîne"); a bare one, or "our" or "the" channel, is a work channel or a button too. In an imported file,
+which may be such a video, they are dropped only with a sign that nobody said them; there that includes a decode Whisper
+itself rejected (still below its own thresholds, average log-probability -1.0 or compression ratio 2.4, after its
+temperature fallback), the reason "a video's phrase Whisper itself rejected". What a meeting says as well ("Спасибо за
+внимание", "Bis zum nächsten Mal", "See you tomorrow", "До новых встреч", "Subscribe to the channel", "Captions by Friday") is
+dropped only with such a sign, and a rejected decode is none (mumbled speech is still said): the line stands alone in its
+stretch of audio spread over five seconds or more of near-silence, or Whisper timed it five seconds or more past the end of the
+audio (into the silence it pads a chunk with; real words of a short chunk end up to about 1.6 s past it). An outro sentence
+at the end of a real line timed that far past its audio is cut off the same way. Video phrases and the outros of 1.11.3 are
+also dropped when they come three times or more on one track, now while recording as well: the lines already shown are
+then taken out of the window again, and the final pass does not show them again. Goodbyes several people say ("See you
+tomorrow.", "Bis zum nächsten Mal.") are never counted that way. Short thanks ("Спасибо.", "Thank you.", "Vielen Dank.",
+"Дякую.") are never dropped by their text, only alone and timed five seconds or more past their audio. Such lines are never
+shown, translated or written, and one note at the end of the track says how many were left out. What still gets through:
+fluent or garbled sentences Whisper writes on wordless voice, song or murmur ("I don't understand.", "Gut, gut, gut, gut."),
+and a short thanks or goodbye at speaking speed; no measured sign tells them apart from real speech. The patterns (139,
+collected from those reports and from other projects' filters) are in `mt.py` above `segment_lines`, and the tests check them
+against real sentences that must stay.
 
 **Live translation, side by side.** With languages chosen under *Also translate to* (`record --live --to Russian`, `follow --to
 Russian`, `--offline` for the local model), every line is translated as soon as it is shown: the line appears first, its
@@ -583,8 +614,9 @@ a row with the column names (since 1.11.0; before, one translation at a time). I
 (all until some are picked; *Clear* leaves the text alone), and *Copy* puts the shown columns on the clipboard tab-separated, so
 they paste into a spreadsheet as shown. Several languages are translated one after the other. The pane is there from the start
 of a live recording, before the first line; *Follow* (on by default) keeps the end in view
-as lines come, change and get their translations. Offline, the translation model (1.4 GB) is loaded beside the speech model, so
-a live recording with offline translation holds both (about 3 GB; with Claude only the speech model). A translation that fails
+as lines come, change and get their translations. Offline, the translation model (1.4 GB for NLLB, about 4.5 GB for Hy-MT3, 7 GB
+for TranslateGemma) is loaded beside the speech model, so a live recording with offline translation holds both (about 3 GB with
+NLLB, about 6 GB with Hy-MT3, an estimate, 8.5 GB with TranslateGemma; with Claude only the speech model). A translation that fails
 (no network, a model that will not load) ends the live translation with a note and the recording goes on; the files are
 translated at the end as before. The live translations are kept with the lines in the checkpoint and the stored meeting, and the
 final pass reuses them instead of translating those lines again (only when they were made the same way: offline live and Claude
@@ -688,7 +720,10 @@ language it is tagged with, so mixed-language transcripts work; lines already in
   for example `JustFrederik/nllb-200-distilled-600M-ct2-int8`, half the size and noticeably worse: on a test it dropped half
   of a long sentence). The first use downloads it (about 1.4 GB; the app and `record`/`transcribe --offline` fetch it before a
   long job starts, not after); after that it runs without internet. The models live in the Hugging Face cache
-  (`~/.cache/huggingface/hub`, about 3 GB with the speech model) — delete that folder to free the space; the engine downloads again when needed.
+  (`~/.cache/huggingface/hub`, about 3 GB with the speech model and NLLB; Hy-MT3 adds 4.2 GB, TranslateGemma 7 GB) — delete that folder to free the space; the engine downloads again when needed.
+  On Apple silicon the app uses [Hy-MT3 7B](#hy-mt3-7b---translator-hy-the-apps-default-on-apple-silicon) unless you pick
+  another model, and [TranslateGemma 12B](#translategemma-12b---translator-gemma) can be chosen; both leave the lines of a
+  language they lack to NLLB. The command line uses NLLB unless `--translator` says otherwise.
 - **Languages:** about 90 common ones by English name or two-letter code (`English`, `ru`, `Brazilian Portuguese`, `Cantonese`, ...),
   or any NLLB code such as `ces_Latn`. An unknown name stops the run before anything starts and says so.
 - **Quality:** below Claude's. NLLB works on single sentences, so each line is split into sentences first; it can still be literal
@@ -702,7 +737,50 @@ language it is tagged with, so mixed-language transcripts work; lines already in
   translation that comes back much shorter than its sentence is counted in the result ("may be incomplete").
 - `translate` of plain text without `[time] [lang]` tags needs `--from LANGUAGE` with `--offline`.
 
-### The second offline model: TranslateGemma 12B (`--translator gemma`)
+### Hy-MT3 7B (`--translator hy`), the app's default on Apple silicon
+
+On a Mac with Apple silicon, `--offline --translator hy` (on any command that translates) or `MT_TRANSLATOR=hy` uses Tencent's
+[Hy-MT3-7B](https://huggingface.co/tencent/Hy-MT3-7B) (released 24 Nov 2026) instead of NLLB, on the GPU through `mlx-lm`. In
+the app it is the *Offline model* for anyone who has not chosen one; a choice made before (TranslateGemma or NLLB) is kept.
+
+- **Languages:** 102 (the model card); in `mt.py` 89 of Whisper's languages plus Traditional Chinese. Breton, Bosnian, Faroese,
+  Hausa, Hawaiian, Latin, Lingala, Maori, Occitan, Shona and Yoruba go to NLLB, which is fetched too, and the note at the end
+  says how many lines did; so does a target outside them (in the app 92 of the 101 offline targets are Hy-MT3's). Kazakh and
+  Mongolian are sent as the Cyrillic varieties (the card's plain Kazakh and Mongolian are other scripts). Both Portuguese targets
+  are written as Portuguese.
+- **Quality, honestly:** every figure so far is Tencent's own, scored by AI judges (report
+  [arXiv 2611.27673](https://arxiv.org/abs/2611.27673): FLORES-200 and WildMTBench; its 4-bit Q4_K_M stays within 0.6 points of
+  bf16, Table 8, but that is llama.cpp's 4-bit, not MLX's). **No independent evaluation exists yet** (the model came out after
+  WMT26), and there are no figures per language pair for Russian or German. This project's own check: 8 made-up meeting lines,
+  Tencent's 7B GGUF on a CPU, 1 of 8 wrong against 3–4 of 8 for NLLB (a spot check, not a benchmark). The pinned MLX copy ran
+  through `mt.py` on a Linux CPU (MLX 0.32.5): download and checks, load, six lines (ru→en three times, de→en, en→ru twice; one
+  of them through `mt.py translate --offline --translator hy`) all right and all ended at the end token, a Yoruba line sent to
+  NLLB, 8–14 minutes a line with MLX working on one core, 4.3–4.4 GiB at peak in that process (a CPU, not the Apple GPU: says
+  nothing about a Mac's speed or memory). Not measured on a Mac.
+- **The copy and the download:** about 4.2 GB, once. The weights are NetProjects' 4-bit MLX copy of Tencent's weights
+  ([`netprojects/Hy-MT3-7B-MLX-4bit`](https://huggingface.co/netprojects/Hy-MT3-7B-MLX-4bit) at commit `dca6fb3`), the tokenizer
+  files Tencent's own (commit `38d6c3c`), because the copy's `tokenizer_config.json` needs transformers 5 and the app pins 4.57.6.
+  Each file is fetched at its pinned commit into the Hugging Face cache and checked against its SHA-256 before use (the 4.2 GB
+  file once; a file that does not match is downloaded again, then the run stops and says which folder to delete).
+  `MT_HY_MODEL` names another copy, a repository id or a folder, which is used as it is (no checksum, its own tokenizer): for
+  example your own `mlx_lm.convert --hf-path tencent/Hy-MT3-7B -q --q-bits 4 --mlx-path ~/models/hy-mt3-7b-4bit`, a 15 GB
+  download. A copy whose `tokenizer_config.json` names `TokenizersBackend` stops with a message to put Tencent's in its place.
+- **Decoding:** greedy, with the card's repetition penalty (1.05 over the last 20 tokens), not the card's sampling: the same line
+  always gives the same text, live, at the end and in a rerun. In a 10-line test meant to provoke loops (Tencent's GGUF on a
+  CPU) no setting looped, and sampling changed half of the lines from run to run. The token limit of a request depends on the
+  target's script (Burmese takes about 8 times the tokens of English); a line that still reaches it is kept and counted in the
+  note ("ran to the token limit").
+- **Cost:** about 4.5 GB of memory, about 6 GB beside the speech model while a recording is translated live (estimates from the
+  same-size Hy-MT2-7B, 4.53 GB at peak; not measured); the run says so on a Mac with less than 12 GB. Speed not measured on a Mac.
+- **Licence:** Apache-2.0; Tencent's LICENSE.txt: "does not impose any additional restrictions beyond those specified in the
+  license". Commercial use is allowed (NLLB's licence does not allow it).
+- **Downloads, setup, live use:** as TranslateGemma's (below): fetched before a job, beside a recording without waiting, the same
+  `requirements-mlx.txt` (no other package), NLLB with a note on an Intel Mac or without `mlx-lm`. **How it is called:** the
+  card's plain prompt ("Translate the following text into English. Note that you should only output the translated result
+  without any additional explanation:" and the text), one line per request, no system prompt; its end token `<|eos|>` is
+  added as a stop token.
+
+### TranslateGemma 12B (`--translator gemma`)
 
 On a Mac with Apple silicon, the app's *Offline model* menu (or `--offline --translator gemma` on any command that
 translates, or `MT_TRANSLATOR=gemma`) uses Google's TranslateGemma 12B instead of NLLB, on the GPU through `mlx-lm`.

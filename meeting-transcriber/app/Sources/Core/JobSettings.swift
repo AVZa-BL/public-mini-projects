@@ -21,7 +21,7 @@ enum Languages {
 
     /// The languages a transcript can be translated into: Whisper's without the three the offline model (NLLB-200) does
     /// not have (Breton, Hawaiian, Latin), with Traditional Chinese and Zulu, which it has, and the two Portuguese that
-    /// TranslateGemma keeps apart (pt-BR, pt-PT; NLLB writes both as Portuguese); each by a name mt.py's nllb_code
+    /// TranslateGemma keeps apart (pt-BR, pt-PT; NLLB and Hy-MT3 write both as Portuguese); each by a name mt.py's nllb_code
     /// accepts (tests/test_mt.py checks every one). Claude translates into any of them too.
     static let targetAll = menuOrder(spokenAll.filter { !["Breton", "Hawaiian", "Latin"].contains($0) }
                                      + ["Traditional Chinese", "Zulu", "Brazilian Portuguese", "European Portuguese"])
@@ -123,21 +123,30 @@ struct DeviceChoice: Equatable {
     }
 }
 
-/// The local translation model (mt.py --translator): NLLB-200 on the CPU, or TranslateGemma 12B on the Apple GPU, which
-/// takes the lines of the 51 languages it was evaluated on and leaves the others to NLLB.
+/// The local translation model (mt.py --translator): Hy-MT3 7B or TranslateGemma 12B on the Apple GPU, which take the
+/// lines of their languages and leave the others to NLLB, or NLLB-200 on the CPU. The order of the cases is the menu's.
 enum OfflineTranslator: String, CaseIterable, Identifiable {
-    case nllb, gemma
+    case hy, gemma, nllb
     var id: String { return rawValue }
 
     var label: String {
         switch self {
+        case .hy: return "Hy-MT3 7B (4.2 GB, Apple silicon)"
         case .nllb: return "NLLB-200 (1.4 GB)"
         case .gemma: return "TranslateGemma 12B (7 GB, Apple silicon)"
         }
     }
 
+    /// The model a user gets who never picked one (nothing stored under "translator"): Hy-MT3 on Apple silicon, NLLB on an
+    /// Intel Mac. A stored choice (also "nllb") is kept; a value this version does not know counts as never picked.
+    static func initial(stored: String?, appleSilicon: Bool) -> OfflineTranslator {
+        if let stored = stored, let chosen = OfflineTranslator(rawValue: stored) { return chosen }
+        return appleSilicon ? .hy : .nllb
+    }
+
     var hint: String {
         switch self {
+        case .hy: return "Tencent's Hy-MT3 7B on the Apple GPU: 102 languages (a line in one it lacks, such as Bosnian or Yoruba, goes to NLLB, which is fetched too). The first use downloads it (about 4.2 GB: a 4-bit copy converted by NetProjects from Tencent's weights, checked against its SHA-256); a recording does not wait for that: its live translation starts once the download is done. It needs about 4.5 GB of memory, about 6 GB beside the speech model while recording (estimates, not yet measured), so 16 GB is comfortable and 8 GB is tight. Its quality figures come from Tencent only; there is no independent evaluation yet. Its licence (Apache-2.0) allows commercial use. If it is not installed (the setup's Apple-GPU step failed), NLLB translates and a note says so."
         case .nllb: return "Meta's NLLB-200 on this Mac's CPU: about 200 languages, the first translation downloads it (about 1.4 GB). Less accurate than Claude, and its licence is non-commercial."
         case .gemma: return "Google's TranslateGemma 12B on the Apple GPU: 51 languages (the others go to NLLB, which is fetched too). The first use downloads it (about 7 GB); a recording does not wait for that: its live translation starts once the download is done. It needs about 7 GB of memory, 8.5 GB beside the speech model while recording, so 16 GB or more. Measured on an Apple M5 with 24 GB: 1.5–2.4 s per sentence, all five test sentences right where NLLB got four. Its licence (Gemma Terms of Use) allows commercial use. If it is not installed (the setup's Apple-GPU step failed), NLLB translates and a note says so."
         }
@@ -163,7 +172,7 @@ struct JobSettings: Equatable {
     var outputDir = ""
     var targets: [String] = []
     var offline = false          // translate on this Mac with the local model instead of with Claude
-    var translator = OfflineTranslator.nllb   // which local model: NLLB-200, or TranslateGemma 12B on the Apple GPU
+    var translator = OfflineTranslator.nllb   // which local model: NLLB-200, Hy-MT3 7B or TranslateGemma 12B (both on the Apple GPU)
     var spoken: [String] = []    // languages spoken in the audio: none = detect any, one = forced, several = detect among them
     var granularity: Granularity = .auto
     var track = ""               // audio track of a video, empty = the first
@@ -244,7 +253,7 @@ struct JobSettings: Equatable {
         var args: [String] = []
         if offline && !targets.isEmpty {
             args.append("--offline")
-            if translator == .gemma { args += ["--translator", "gemma"] }
+            if translator != .nllb { args += ["--translator", translator.rawValue] }   // NLLB is mt.py's default
         }
         for target in targets { args += ["--to", target] }
         return args

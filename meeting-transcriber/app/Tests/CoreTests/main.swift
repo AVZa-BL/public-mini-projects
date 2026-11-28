@@ -255,6 +255,29 @@ expect(!gemOnline.arguments(scriptPath: "m").contains("--translator"), "with Cla
 var gemLive = gem; gemLive.mode = .record
 expect(gemLive.recordingArguments(scriptPath: "m").suffix(7) == ["--offline", "--translator", "gemma", "--to", "English", "--to", "Russian"], "the live translation uses it too")
 expect(OfflineTranslator.allCases.allSatisfy { !$0.label.isEmpty && !$0.hint.isEmpty }, "every offline model is described")
+var hyJob = off; hyJob.translator = .hy
+expect(hyJob.arguments(scriptPath: "m") == ["m", "transcribe", "/m/a.mp3", "--offline", "--translator", "hy", "--to", "English", "--to", "Russian"], "Hy-MT3 is passed as the offline translator")
+var hyLive = hyJob; hyLive.mode = .record
+expect(hyLive.recordingArguments(scriptPath: "m").suffix(7) == ["--offline", "--translator", "hy", "--to", "English", "--to", "Russian"], "the live translation uses Hy-MT3 too")
+expect(hyJob.followArguments(scriptPath: "m", mic: "a.wav", system: "b.wav", into: "/d").suffix(7) == ["--offline", "--translator", "hy", "--to", "English", "--to", "Russian"], "a followed call translates live with Hy-MT3 too")
+var hyStored = hyJob; hyStored.mode = .translate
+expect(hyStored.translateStoredArguments(scriptPath: "m", entry: Recordings.Entry(folder: "/d/1", name: "x", date: nil, kind: .single(audio: "/d/1/a.wav"), hasTranscript: true, hasCheckpoint: false)) == ["m", "translate", "/d/1", "--offline", "--translator", "hy", "--to", "English", "--to", "Russian"], "a stored meeting is translated with Hy-MT3 too")
+var hyOnline = hyJob; hyOnline.offline = false
+expect(!hyOnline.arguments(scriptPath: "m").contains("--translator"), "with Claude Hy-MT3 is not passed")
+var hyNone = hyJob; hyNone.targets = []
+expect(!hyNone.arguments(scriptPath: "m").contains("--translator") && !hyNone.arguments(scriptPath: "m").contains("--offline"), "no language to translate to: no offline model is passed")
+expect(off.arguments(scriptPath: "m").firstIndex(of: "--translator") == nil, "NLLB, the command line's default, is not passed")
+expect(hyJob.environment(home: "/h", apiKey: "sk-x")["ANTHROPIC_API_KEY"] == nil && hyJob.environment(home: "/h", apiKey: nil)["MT_TRANSLATOR"] == nil, "Hy-MT3 goes by --translator only: the job's environment adds no key and no MT_TRANSLATOR (Runner.run also drops an inherited MT_TRANSLATOR)")
+expect(OfflineTranslator.initial(stored: nil, appleSilicon: true) == .hy, "never picked, Apple silicon: Hy-MT3")
+expect(OfflineTranslator.initial(stored: nil, appleSilicon: false) == .nllb, "never picked, Intel: NLLB")
+expect(OfflineTranslator.initial(stored: "gemma", appleSilicon: true) == .gemma, "a TranslateGemma choice is kept")
+expect(OfflineTranslator.initial(stored: "nllb", appleSilicon: true) == .nllb, "an NLLB choice is kept")
+expect(OfflineTranslator.initial(stored: "hy", appleSilicon: false) == .hy, "a stored choice is returned as stored (the window maps it to NLLB on Intel)")
+expect(OfflineTranslator.initial(stored: "marian", appleSilicon: true) == .hy, "an unknown stored value counts as never picked")
+expect(OfflineTranslator.initial(stored: "", appleSilicon: true) == .hy, "an empty stored value counts as never picked")
+expect(OfflineTranslator.allCases.map { $0.rawValue } == ["hy", "gemma", "nllb"], "menu order: the default first; raw values are mt.py's --translator values")
+expect(OfflineTranslator.hy.label.contains("4.2 GB") && OfflineTranslator.hy.hint.contains("4.2 GB") && OfflineTranslator.hy.hint.contains("Apache-2.0"), "Hy-MT3's size and licence are shown")
+expect(OfflineTranslator.gemma.label == "TranslateGemma 12B (7 GB, Apple silicon)" && OfflineTranslator.nllb.label == "NLLB-200 (1.4 GB)", "the two older labels are unchanged")
 var offNone = JobSettings(); offNone.files = ["/m/a.mp3"]; offNone.offline = true
 expect(offNone.arguments(scriptPath: "m") == ["m", "transcribe", "/m/a.mp3"], "offline without languages adds nothing")
 var offTr = JobSettings(); offTr.mode = .translate; offTr.files = ["/t/a.txt"]; offTr.targets = ["German"]; offTr.offline = true

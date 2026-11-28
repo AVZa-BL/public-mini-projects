@@ -430,7 +430,9 @@ def test_every_language_the_app_offers_is_one_mt_py_accepts():
     targets = _app_languages("targetAll")
     unknown = [name for name in targets if not mt.nllb_code(name)]
     assert not unknown, f"the offline model does not know {unknown}"
-    assert len({(mt.nllb_code(name), mt.gemma_code(name)) for name in targets}) == len(targets), "two names for one language"
+    assert len({(mt.nllb_code(name), mt.gemma_code(name), mt.hy_code(name)) for name in targets}) == len(targets), \
+        "two names for one language"
+    assert sum(1 for name in targets if mt.hy_code(name)) == 92, "Hy-MT3 takes 92 of the app's targets, NLLB the others"
     assert {"pt-BR", "pt-PT", "zh-TW"} <= {mt.gemma_code(name) for name in targets}, "TranslateGemma's regional targets"
     assert all(mt.nllb_code(name) is None for name in ("Breton", "Hawaiian", "Latin")), "the three left out of the targets"
 
@@ -702,6 +704,513 @@ def test_a_live_track_neither_shows_nor_translates_a_made_up_line_but_keeps_it_f
     assert [l["text"] for l in shown] == ["Добрый день."] and translated == ["Добрый день."]
     assert "DimaTorzok" not in capsys.readouterr().out
     assert [l.get("made_up") for l in seen[0]] == ["a subtitle credit", None], "the checkpoint keeps it, for the final count"
+
+
+VIDEO_PHRASES = ["I can see you in the next video.", "I'll see you in the next episode.", "Danke fürs Zuschauen.", "Продолжение следует...",
+                 "Thanks for watching!", "Thank you for watching.", "Подпишитесь на мой канал.", "Подписывайтесь на мой канал!",
+                 "Ставьте лайки и подписывайтесь на канал.", "Субтитры сделал Иван Петров", "Субтитры подготовил Симон", "Fortsetzung folgt.",
+                 "Продовження буде...", "Спасибо за просмотр!", "Wenn ja, dann lasst mir einen Daumen da und abonniert meinen Kanal.",
+                 "Music playing", "Субтитры подготовлены Иваном Петровым", "SWR 2021", "Hello everyone, welcome to my channel.",
+                 "Всем привет и добро пожаловать на мой канал."]
+
+
+@pytest.mark.parametrize("text", VIDEO_PHRASES)
+def test_in_a_recording_a_videos_outro_or_channel_plug_is_dropped_by_its_text(text):
+    """A meeting does not say "Thanks for watching" or "Подпишитесь на канал": recorded, such a line is one Whisper made
+    up, even at speaking speed beside other lines (1.11.4: they showed live on short chunks, never stretched)."""
+    assert mt.made_up(_said(text, 0, 1.4), alone=False, audio_end=1.5, context="recording") == "a video's outro or channel plug"
+
+
+@pytest.mark.parametrize("text", VIDEO_PHRASES)
+def test_in_an_imported_file_a_videos_outro_is_dropped_only_with_a_sign_that_nobody_said_it(text):
+    """An imported file may be that video: its outro is said. Only a decode Whisper itself failed hides it."""
+    assert mt.made_up(_said(text, 0, 1.4), alone=True, audio_end=1.5) is None
+    assert mt.made_up(_said(text, 0, 1.4), alone=True, audio_end=1.5, context="media") is None
+    failed = dict(_said(text, 0, 1.4), _lp=-1.2, _temp=1.0)
+    assert mt.made_up(failed, alone=False, audio_end=1.5, context="media") == "a video's phrase Whisper itself rejected"
+    assert mt.made_up(dict(failed, end=30.0), alone=False, audio_end=1.5, context="media") == "an outro over near-silence", \
+        "timed into the padding: that sign is named first"
+
+
+NEW_CREDITS = ["Субтитры А.Синецкая", "Корректор .Кулакова", "Субтитры и корректура Оксаны Каменской", "www.northstarit.co.uk",
+               "This video is a derivative work of the Touhou Project.", "[Music]", "[APPLAUSE]", "* Musik *", "*Klopfen*", "♪♪", "(Musik)",
+               "♪ Musik ♪", "Корректор.Кулакова"]
+OLD_CREDITS = ["Субтитры сделал DimaTorzok", "Субтитры создавал DimaTorzok.", "Редактор субтитров А.Синецкая Корректор А.Егорова",
+               "Редактор субтитров Е.Воинова Корректор А.Кулакова", "Корректор А.Егорова", "Спасибо за субтитры Алексею Дубровскому!",
+               "Subtitles by the Amara.org community", "Untertitel im Auftrag des ZDF, 2020", "Sottotitoli creati dalla comunità Amara.org",
+               "Napisy stworzone przez społeczność Amara.org", "ДИНАМИЧНАЯ МУЗЫКА", "Продолжение следует... Субтитры сделал DimaTorzok"]
+
+
+@pytest.mark.parametrize("context", ["media", "recording"])
+@pytest.mark.parametrize("text", NEW_CREDITS + OLD_CREDITS)
+def test_subtitle_credits_and_bracketed_sound_captions_are_made_up_in_every_context(text, context):
+    assert mt.made_up(_said(text), alone=False, context=context) == "a subtitle credit"
+
+
+# The REAL sentences of the 1.11.4 phrase study (scratchpad research/phrases.py): what meetings say that looks like an outro
+STUDY_REAL = ["Спасибо.", "Спасибо большое.", "Спасибо за внимание.", "Всем спасибо, до свидания.",
+              "Продолжение следует на следующей неделе, когда придут цифры.", "Мы решили, что продолжение следует завтра.",
+              "Субтитры к фильму мы сделаем сами.", "Корректор нашёл три ошибки в договоре.", "Подпишите, пожалуйста, договор.",
+              "Музыка в рекламе слишком громкая.", "Редактор субтитров у нас один.", "Thank you.", "Thanks.", "Okay, thank you, bye.",
+              "I'm sorry, could you repeat that?", "Thanks for watching the demo, any questions?", "Please subscribe to the mailing list.",
+              "Subtitles by Friday would be great.", "We'll be right back after the break.", "Vielen Dank.", "Danke schön.",
+              "Bis zum nächsten Mal, dann mit den Zahlen.", "Das war's für heute.", "Untertitel brauchen wir für das Video auch.",
+              "Musik machen wir später.", "Барсук, живущий в Киевском зоопарке, совершил побег из своего вольера.",
+              "Ask not what your country can do for you. Ask what you can do for your country.",
+              "Alles hat ein Ende, nur die Wurst hat zwei.",
+              "Raptorium-Bergbau scheint profitierter als Monroe als Reaktion auf die wirtschaftlichen Ausfälle zu sein."]
+REAL_REPLIES = ["Thank you.", "Спасибо.", "Danke.", "Да.", "Vielen Dank.", "Большое спасибо.", "Gracias.", "Bye.", "Музыка.",
+                "Спасибо за внимание.", "Спасибо за внимание и до новых встреч.", "Bis zum nächsten Mal.", "Bis zum nächsten Mal. Tschüss.",
+                "Das war's für heute.", "I'll see you next time.", "See you next week.", "Okay, see you tomorrow.",
+                "Thank you for watching the demo, any questions?", "Please subscribe to the mailing list.", "Musik machen wir später.",
+                "Продолжение следует на следующей неделе, когда придут цифры.", "Продолжение следует за вступлением.",
+                "Vielen Dank fürs Zuhören.", "Субтитры к фильму мы сделаем сами.", "We use Amara.org for our subtitles at work.",
+                "Редактор субтитров у нас Аня.", "Корректор нашёл три ошибки."]
+
+
+@pytest.mark.parametrize("context", ["media", "recording"])
+@pytest.mark.parametrize("text", sorted(set(REAL_REPLIES + STUDY_REAL)))
+def test_real_replies_and_meeting_outros_are_kept_in_every_context_even_when_mumbled(text, context):
+    """Short thanks and the outros people say in meetings are never dropped by their text, alone or not, and a failed
+    decode (speech under mumble) is no sign against them, not even for a whole chunk."""
+    for alone in (True, False):
+        line = dict(_said(text, 0, 1.8), _lp=-0.3, _temp=0.0)
+        assert mt.made_up(line, alone=alone, audio_end=2.0, context=context) is None
+        assert mt.screen_made_up([line, *([] if alone else [_said("Und weiter.", 2.0)])], 2.0, context)[0]["text"] == text
+        mumbled = dict(_said(text, 0, 1.8), _lp=-1.3, _temp=1.0)
+        assert mt.made_up(mumbled, alone=alone, audio_end=2.0, context=context) is None
+        assert mt.screen_made_up([dict(mumbled)], 2.0, context)[0] == _said(text, 0, 1.8), "a chunk of failed decodes is kept"
+
+
+def test_a_short_thanks_is_dropped_only_alone_and_timed_past_the_end_of_its_audio():
+    """Whisper put 'Thank you.' at 0-30 s on a 1.5 s chunk: the words are in the zero padding, nobody said them. Real
+    lines ended at most 0.51 s past their audio in the harvest, 1.62 s on 1-1.4 s chunks (the threshold is 5 s)."""
+    long = _said("Thank you.", 0, 30.0)
+    assert mt.made_up(long, alone=True, audio_end=1.5) == "thanks over near-silence"
+    assert mt.made_up(long, alone=False, audio_end=1.5) is None, "beside another line of its chunk: kept"
+    assert mt.made_up(long, alone=True, audio_end=29.5) is None, "0.5 s past the audio is how real lines end"
+    assert mt.made_up(long, alone=True, audio_end=25.5) is None, "4.5 s past it is still not the padding's end"
+    assert mt.made_up(dict(_said("Thank you.", 0, 1.4), _lp=-1.3, _temp=1.0), alone=True, audio_end=1.5) is None, "a failed decode alone is no sign"
+    assert mt.made_up(long, alone=True) is None, "without the audio's end (a checkpoint's line) nothing changes"
+    assert mt.made_up(_said("Спасибо за внимание.", 0, 30.0), alone=False, audio_end=2.0) == "an outro over near-silence"
+    assert mt.made_up(_said("Спасибо за внимание.", 0, 2.0), alone=True, audio_end=2.0) is None
+    assert mt.made_up(_said("Bis zum nächsten Mal.", 0, 25.0), alone=True) == "an outro over near-silence", "the stretch rule stays"
+
+
+def test_an_outro_glued_to_a_real_line_comes_off_only_when_the_line_runs_past_its_audio():
+    glued = "Хорошо, договорились. Продолжение следует..."
+    assert mt.screen_made_up([_said(glued, 0, 30.0)], 3.0)[0]["text"] == "Хорошо, договорились."
+    assert mt.screen_made_up([_said(glued, 0, 3.0)], 3.0, "media")[0]["text"] == glued, "an imported file: it may be said"
+    # In a recording a video's phrase at the end comes off by its text, as a whole line of one is dropped (1.11.4
+    # review); a meeting's outro, a goodbye or a short thanks there still needs the line to run past its audio
+    assert mt.screen_made_up([_said(glued, 0, 3.0)], 3.0, "recording")[0]["text"] == "Хорошо, договорились."
+    for outro in ("Спасибо за внимание.", "До новых встреч.", "Спасибо.", "Подписывайтесь на наш канал."):
+        said = "Хорошо, договорились. " + outro
+        assert mt.screen_made_up([_said(said, 0, 3.0)], 3.0, "recording")[0]["text"] == said
+        if outro != "Спасибо.":                                    # a short thanks at the end of a line is never cut off
+            assert mt.screen_made_up([_said(said, 0, 30.0)], 3.0, "recording")[0]["text"] == "Хорошо, договорились."
+    assert mt.screen_made_up([_said("Продолжение следует... Хорошо, договорились.", 0, 3.0)], 3.0, "recording")[0]["text"] == \
+        "Продолжение следует... Хорошо, договорились.", "only at the end, where Whisper appends its outros"
+    assert mt.screen_made_up([_said("Это был отличный доклад. Субтитры сделал DimaTorzok")])[0]["text"] == "Это был отличный доклад."
+    # a credit that _sentences cuts in two ('Untertitelung.' + 'BR 2018') is still one credit
+    assert mt.screen_made_up([_said("Доклад окончен. Untertitelung. BR 2018")])[0]["text"] == "Доклад окончен."
+    for context, end in (("recording", 2.0), ("media", 30.0)):      # 'BR 2018' alone is a video's tag: the credit goes whole
+        assert mt.screen_made_up([_said("Gut. Untertitelung. BR 2018", 0, end)], 3.0, context)[0]["text"] == "Gut."
+    assert mt.made_up(_said("Untertitelung. BR 2018"), alone=False) == "a subtitle credit"
+    for credits in ("Продолжение следует... Untertitelung. BR 2018", "Субтитры сделал DimaTorzok. Untertitelung. BR 2018"):
+        assert mt.made_up(_said(credits), alone=False) == "a subtitle credit", "nothing but credits: not a line to trim"
+
+
+# What a meeting says that looks like a video's phrase or a credit (1.11.4 review): never dropped by its text alone
+SAID_AT_WORK = ["Subtitles by Friday.", "Captions by Monday.", "Captions by Zoom.", "Transcription by Whisper.", "Captions by Rev.",
+                "Transcribed by Otter.", "Субтитры подготовлены.", "Субтитры сделаны.", "Субтитры подготовлены вчера.",
+                "Субтитры сделаны для второго ролика.", "Субтитры созданы автоматически.", "Субтитры созданы, но не проверены.",
+                "Subscribe.", "Please subscribe.", "Subscribe to the channel.", "Subscribe to our channel.", "Don't forget to subscribe.",
+                "Подпишитесь на канал.", "Подпишись на канал.", "Подписывайтесь на наш канал.", "Подписаться на канал.",
+                "Не забудьте подписаться.", "Abonniert den Kanal.", "Bitte abonnieren.", "Продолжение следует?", "Fortsetzung folgt?",
+                "See you in the next one.", "I'll see you in the next one.", "Okay, see you in the next one.", "See you tomorrow.",
+                "See you later.", "Until next time.", "До новых встреч.", "Корректор Егорова.", "Корректор — Кулакова.",
+                "Корректор. Егорова.", "♪ Happy birthday to you ♪"]
+
+
+@pytest.mark.parametrize("context", ["media", "recording"])
+@pytest.mark.parametrize("text", SAID_AT_WORK)
+def test_what_a_meeting_says_like_a_videos_phrase_is_kept_without_a_sign_that_nobody_said_it(text, context):
+    for alone in (True, False):
+        assert mt.made_up(_said(text, 0, 1.4), alone=alone, audio_end=1.5, context=context) is None
+        lines = mt.screen_made_up([_said(text, 0, 1.4), *([] if alone else [_said("Und weiter.", 2.0)])], 1.5, context)
+        assert lines[0]["text"] == text and "made_up" not in lines[0]
+    glued = "Хорошо, договорились. " + text
+    assert mt.screen_made_up([_said(glued, 0, 2.4)], 2.5, context)[0]["text"] == glued
+
+
+@pytest.mark.parametrize("text", ["Спасибо.", "Thank you.", "Danke.", "Vielen Dank.", "Bye.", "Музыка.", "See you tomorrow.",
+                                  "До новых встреч.", "Спасибо за внимание.", "Das war's für heute.", "Bis zum nächsten Mal.",
+                                  "Subscribe.", "I'm not sure what I'm doing here."])
+def test_a_short_reply_whisper_timed_to_a_round_second_past_its_short_chunk_is_kept(text):
+    """On a 1-1.4 s chunk Whisper ends real words at a round 2 or 3 s after their start: 'барсук' on the chunk
+    1.14-2.51 s came out as 1.1-4.1 s, 1.59 s past the audio (1.11.4 measurement with large-v3-turbo)."""
+    for context in ("media", "recording"):
+        for alone in (True, False):
+            assert mt.made_up(_said(text, 1.1, 4.1), alone=alone, audio_end=2.51, context=context) is None
+        assert mt.screen_made_up([_said(text, 1.1, 4.1)], 2.51, context)[0] == _said(text, 1.1, 4.1)
+        glued = "Хорошо, договорились. " + text
+        assert mt.screen_made_up([_said(glued, 1.1, 4.1)], 2.51, context)[0]["text"] == glued
+    assert mt.made_up(_said("Спасибо.", 0.0, 3.0), alone=True, audio_end=1.4) is None, "1.6 s past a 1.4 s chunk: kept"
+
+
+def test_a_thanks_left_when_a_credit_is_trimmed_off_is_screened_again():
+    """'Спасибо. Субтитры сделал DimaTorzok' timed 28.5 s past its audio: the credit comes off and what is left is the
+    short thanks Whisper put in the padding; at speaking speed the thanks stays."""
+    for text in ("Спасибо. Субтитры сделал DimaTorzok", "Thank you. Subtitles by the Amara.org community"):
+        hidden = mt.screen_made_up([_said(text, 0, 30.0)], 1.5, "recording")[0]
+        assert hidden["made_up"] == "thanks over near-silence"
+        kept = mt.screen_made_up([_said(text, 0, 1.4)], 1.5, "recording")[0]
+        assert kept["text"] == text.split(". ")[0] + "." and "made_up" not in kept
+    assert mt.screen_made_up([_said("Продолжение следует... Спасибо.", 0, 30.0)], 1.5, "recording")[0]["made_up"]
+
+
+@pytest.mark.parametrize("outro", ["See you tomorrow.", "See you later!", "I'll see you tomorrow.", "Until next time.", "До новых встреч.",
+                                   "Спасибо за внимание и до новых встреч.", "Das war's für heute.", "See you in the next one.",
+                                   "Bis zum nächsten Mal.", "Bis zum nächsten Mal!", "До зустрічі.", "Дякую за увагу."])
+def test_a_goodbye_three_people_say_on_one_track_is_neither_withdrawn_nor_left_out(outro):
+    """At the end of a call the other side's track carries everyone: three "See you tomorrow." are three people."""
+    track, lines = SimpleNamespace(), []
+    for k in range(3):
+        chunk = mt.screen_made_up([_said(outro, 10.0 * k, 10.0 * k + 1.4), _said("Ja, gut.", 10.0 * k + 2.0)], 10.0 * k + 4.0, "recording")
+        assert mt.mark_repeated_outros(track, chunk) is False
+        lines += chunk
+    assert [l["text"] for l in mt.without_made_up(lines)].count(outro) == 3
+    assert mt.drop_repeated_outros(lines) == (lines, 0)
+
+
+def test_copies_of_an_outro_never_shown_are_marked_without_withdrawing_anything():
+    """Three copies in one chunk: all are left out, but none was on screen, so the window is not sent again (1.11.4
+    review: a needless @@CLEAR and resend); a copy shown in an earlier chunk is withdrawn."""
+    track, chunk = SimpleNamespace(), [_said("Bitte abonnieren.", 2.0 * k, 2.0 * k + 1.4) for k in range(3)]
+    assert mt.mark_repeated_outros(track, chunk) is False
+    assert [l.get("made_up") for l in chunk] == [mt.REPEATED] * 3
+    track, shown = SimpleNamespace(), [_said("Bitte abonnieren.", 0.0, 1.4)]
+    assert mt.mark_repeated_outros(track, shown) is False and "made_up" not in shown[0]
+    later = [_said("Bitte abonnieren.", 10.0, 11.4), _said("Bitte abonnieren.", 12.0, 13.4)]
+    assert mt.mark_repeated_outros(track, later) is True
+    assert [l.get("made_up") for l in shown + later] == [mt.REPEATED] * 3
+
+
+# Channel plugs (1.11.4 review): only the 'my channel' forms are a video's; the bare, 'our' and 'the' forms are a work
+# channel or a button too, as in English, Russian and German
+MY_CHANNEL = ["Підписуйтесь на мій канал!", "Abonnez-vous à ma chaîne !", "N'oubliez pas de vous abonner à ma chaîne.",
+              "¡Suscríbete a mi canal!", "Iscriviti al mio canale!", "Inscreva-se no meu canal!", "Subskrybuj mój kanał!"]
+WORK_CHANNEL = ["Підписуйтесь на канал.", "Підписуйтесь на наш канал.", "Abonnez-vous.", "Abonnez-vous à notre chaîne.",
+                "Abonnez-vous à la chaîne.", "N'oubliez pas de vous abonner.", "Suscríbete.", "Suscríbete al canal.", "Iscriviti.",
+                "Iscriviti al canale.", "Inscreva-se no canal.", "Subskrybuj.", "Subskrybuj nasz kanał.", "Zasubskrybuj."]
+
+
+@pytest.mark.parametrize("text", MY_CHANNEL)
+def test_a_plug_for_my_channel_is_a_videos_phrase(text):
+    assert mt._made_up_kind(text) == "media"
+    assert mt.made_up(_said(text, 0, 1.4), alone=False, audio_end=1.5, context="recording") == "a video's outro or channel plug"
+
+
+@pytest.mark.parametrize("context", ["media", "recording"])
+@pytest.mark.parametrize("text", WORK_CHANNEL)
+def test_a_plug_for_the_or_our_channel_is_kept_without_a_sign(text, context):
+    assert mt._made_up_kind(text) == "doubtful"
+    assert mt.screen_made_up([_said(text, 0, 1.4)], 1.5, context)[0] == _said(text, 0, 1.4)
+    assert mt.made_up(_said(text, 0, 30.0), alone=True, audio_end=1.5, context=context) == "an outro over near-silence"
+
+
+def test_a_meeting_outro_with_a_credit_after_it_keeps_the_outro():
+    """'Спасибо за внимание. Субтитры сделал DimaTorzok' at speaking speed: the credit comes off and the outro is
+    screened again, as a short thanks is; timed into the padding it is hidden (1.11.4 review: it was hidden whole)."""
+    for context in ("recording", "media"):
+        for text in ("Спасибо за внимание. Субтитры сделал DimaTorzok", "Dziękuję za uwagę. Napisy stworzone przez społeczność Amara.org"):
+            kept = mt.screen_made_up([_said(text, 0, 2.0)], 2.0, context)[0]
+            assert kept["text"] == text.split(". ")[0] + "." and "made_up" not in kept
+            assert mt.screen_made_up([_said(text, 0, 30.0)], 2.0, context)[0]["made_up"] == "an outro over near-silence"
+        assert mt.made_up(_said("Продолжение следует... Субтитры сделал DimaTorzok"), alone=False, context=context) == "a subtitle credit"
+
+
+GERMAN_CREDITS = ["Untertitel im Auftrag des ZDF, 2020", "Untertitel im Auftrag des ZDF, 2017", "Untertitel im Auftrag des ZDF für funk, 2017",
+                  "Untertitel im Auftrag des ZDF für funk, 2017-2021", "Untertitelung im Auftrag des ZDF, 2021",
+                  "Untertitelung des ZDF, 2020", "Untertitelung des ZDF für funk, 2017", "Untertitelung des ZDF.", "Untertitelung. BR 2018"]
+
+
+@pytest.mark.parametrize("context", ["media", "recording"])
+def test_the_german_broadcaster_credits_are_hidden_and_a_plain_mention_of_the_broadcaster_is_kept(context):
+    for text in GERMAN_CREDITS:
+        assert mt.made_up(_said(text), alone=False, context=context) == "a subtitle credit", text
+    for text in ("Untertitel für ARD und ZDF.", "Untertitel vom ZDF.", "Untertitel brauchen wir bis Freitag.",
+                 "Welcher Sender war das? Untertitel des ZDF?", "Untertitel des ZDF? Ja."):
+        assert mt.screen_made_up([_said(text, 0, 1.4)], 1.5, context)[0] == _said(text, 0, 1.4), text
+
+
+@pytest.mark.parametrize("context", ["media", "recording"])
+@pytest.mark.parametrize("text", ["Music playing?", "Music continues?", "Phone rings?", "Bell rings?", "Birds chirping?", "SWR 2021?",
+                                  "ZDF, 2021?", "This is the end of the video.", "This is the end of the video?",
+                                  "♪ Happy birthday ♪", "♪ Zum Geburtstag ♪", "♪ Happy birthday to you ♪",
+                                  # every video's phrase asked, and a German broadcaster credit asked (1.11.4 review)
+                                  "Thanks for watching?", "Спасибо за просмотр?", "Субтитры сделал Иван?", "Ставьте лайки?",
+                                  "Ставь лайк?", "Subscribe to my channel?", "Welcome to my channel?", "Danke fürs Zuschauen?",
+                                  "Bis zum nächsten Video?", "Dziękuję za obejrzenie?", "Suscríbete a mi canal?",
+                                  "Untertitel des ZDF?", "Untertitelung der ARD?", "Untertitel ZDF 2024?"])
+def test_a_question_a_clip_ending_or_a_sung_line_is_never_a_videos_phrase_or_a_caption(text, context):
+    for alone in (True, False):
+        lines = mt.screen_made_up([_said(text, 0, 1.4), *([] if alone else [_said("Und weiter.", 2.0)])], 1.5, context)
+        assert lines[0] == _said(text, 0, 1.4)
+
+
+@pytest.mark.parametrize("text", ["Music playing", "Phone rings.", "SWR 2021", "This is the end of the video, remember to like and subscribe!",
+                                  "♪ Musik ♪", "♪♪", "♪ Sanfte Musik ♪", "♪ música ♪", "♪ Music ♪ ♪ Music ♪"])
+def test_the_statements_of_those_captions_and_phrases_stay_hidden_in_a_recording(text):
+    assert mt.made_up(_said(text, 0, 1.4), alone=False, audio_end=1.5, context="recording") is not None
+
+
+# The variants Whisper writes of the phrases already listed (1.11.4 review, fp-lens hallucinations.py)
+VARIANTS = ["Ставьте лайки, подписывайтесь на канал!", "Подписывайтесь на канал, ставьте лайки!", "Подписывайтесь на канал и жмите на колокольчик!",
+            "Подписывайтесь на канал, ставьте лайки и жмите на колокольчик!", "Ставь лайк!", "Субтитры сделал DimaTorzok Субтитры сделал DimaTorzok",
+            "Продолжение следует Продолжение следует", "Продолжение следует... Продолжение следует...", "Спасибо за просмотр видео!",
+            "Спасибо за просмотр этого видео!", "Спасибо, что посмотрели это видео!", "Спасибо за просмотр, до новых встреч!",
+            "Дякую за перегляд і до зустрічі!", "Dziękuję za obejrzenie!", "Wir sehen uns im nächsten Video!", "Bis zum nächsten Video!",
+            "¡Suscríbete y dale like!", "Thanks for watching, everyone!", "Thanks for watching, guys!", "Thanks for watching, bye!",
+            "Thank you for watching, and don't forget to like and subscribe!", "Welcome to my channel!", "Welcome back to my channel."]
+
+
+@pytest.mark.parametrize("text", VARIANTS)
+def test_the_variants_of_a_videos_phrases_are_dropped_in_a_recording_and_kept_in_an_imported_file(text):
+    assert mt.made_up(_said(text, 0, 1.4), alone=False, audio_end=1.5, context="recording") is not None
+    credit = "DimaTorzok" in text                                  # a named subtitle author: a credit everywhere
+    assert mt.made_up(_said(text, 0, 1.4), alone=True, audio_end=1.5, context="media") == ("a subtitle credit" if credit else None)
+
+
+@pytest.mark.parametrize("text", ["Дякую.", "Дякую вам.", "Щиро дякую.", "Дуже дякую.", "Всем пока!", "До побачення.", "Бувайте!",
+                                  "Дякую за увагу.", "До зустрічі!"])
+def test_the_ukrainian_thanks_and_goodbyes_need_a_sign_that_nobody_said_them(text):
+    assert mt._made_up_kind(text) in ("short", "meeting")
+    for context in ("media", "recording"):
+        for alone in (True, False):
+            assert mt.made_up(_said(text, 0, 1.4), alone=alone, audio_end=1.5, context=context) is None
+        assert mt.made_up(_said(text, 0, 30.0), alone=True, audio_end=1.5, context=context) is not None
+
+
+@pytest.mark.parametrize("context", ["media", "recording"])
+@pytest.mark.parametrize("text", ["Субтитры сделал DimaTorzok Продолжение следует", "Субтитры сделал DimaTorzok, Продолжение следует...",
+                                  "Редактор субтитров А.Синецкая Корректор А.Егорова Продолжение следует..."])
+def test_a_credit_run_into_an_outro_is_a_credit(text, context):
+    assert mt.made_up(_said(text, 0, 1.4), alone=False, audio_end=1.5, context=context) == "a subtitle credit"
+    assert mt.screen_made_up([_said("Мы решили, что продолжение следует завтра.", 0, 1.4)], 1.5, context)[0]["text"] == \
+        "Мы решили, что продолжение следует завтра."
+
+
+def _replay_screen_cases(context):
+    """The harvested lines (tests/data/screen_cases.jsonl: 440 lines that large-v3-turbo int8 gave through mt.py's own
+    live and batch paths on 35 synthetic cases of noise, wordless voice and real speech) screened again as decode_chunk
+    screens them, one call per chunk or piece, with live repetition per run. -> {row index: (what, text)}."""
+    rows = [json.loads(x) for x in open(Path(__file__).parent / "data" / "screen_cases.jsonl", encoding="utf-8")]
+    result, runs = {}, {}
+    for i, r in enumerate(rows):
+        runs.setdefault(r["run"], {}).setdefault(r["piece"], []).append((i, r))
+    for run, pieces in runs.items():
+        track = SimpleNamespace()
+        for piece in pieces.values():
+            lines = [{"t": r["t"], "end": r["end"], "lang": "x", "conf": 1.0, "text": r["text"], "_lp": r["lp"], "_temp": r["temp"],
+                      "_cr": r["cr"]} for _, r in piece]
+            ids = {id(l): i for l, (i, _) in zip(lines, piece)}
+            out = mt.screen_made_up(lines, piece[0][1]["audio_end"], context)
+            if piece[0][1]["mode"] == "live":
+                mt.mark_repeated_outros(track, out)
+            for line in out:
+                i = ids[id(line)]
+                assert not any(k in line for k in ("_lp", "_temp", "_cr"))
+                result[i] = ("hidden" if line.get("made_up") else "trimmed" if line["text"] != rows[i]["text"] else "shown", line["text"])
+    return rows, result
+
+
+@pytest.mark.parametrize("context", ["recording", "media"])
+def test_the_harvested_lines_lose_their_made_up_outros_and_no_real_speech(context):
+    rows, result = _replay_screen_cases(context)
+    real = [i for i, r in enumerate(rows) if r["label"] in ("real", "unmatched", "real+appended")]
+    assert len(real) == 219 and [rows[i]["text"] for i in real if result[i][0] != "shown"] == []
+    live = [i for i, r in enumerate(rows) if r["mode"] == "live" and r["label"] == "made_up" and r["shown_before"]]
+    assert len(live) == 97
+    gone = [i for i in live if result[i][0] == "hidden"]
+    assert len(gone) >= 4, "the measured floor (1.11.4): later pattern work may only raise it"
+    for i in live:
+        if rows[i]["text"] in ("Danke fürs Zuschauen.", "I can see you in the next video.", "Vielen Dank."):
+            assert result[i][0] == "hidden", rows[i]["text"]
+    # The limits, documented: a short thanks or a meeting's goodbye with no sign that nobody said it stays (a real
+    # 'Gracias.' or 'I'll see you next time.' must), and so does fluent text on wordless voice
+    assert any(result[i][0] == "shown" for i in live if rows[i]["text"] == "Gracias.")
+    assert all(result[i][0] == "shown" for i in live if rows[i]["text"] == "I'll see you next time.")
+    assert any(result[i][0] == "shown" for i, r in enumerate(rows) if r["mode"] == "batch" and r["text"] == "Thank you."
+               and r["label"] == "made_up")
+
+
+def test_a_chunk_whose_every_line_failed_its_decode_is_kept_as_speech(monkeypatch, tmp_path):
+    """A decode Whisper rejected at every temperature is still Whisper's best text: the real 'als' of a 1.3 s chunk
+    came out as 'So als Riech.' at -1.02 (1.11.4 measurement), so a failed chunk is never turned into a note."""
+    import numpy as np
+    bad = {"start": 0.0, "end": 1.0, "text": " So als Riech.", "logprob": -1.021, "temp": 1.0, "cr": 0.62}
+    chunk = np.zeros(int(16000 * 1.34), dtype="float32")
+    for context in ("recording", "media"):
+        lines = mt.decode_chunk(FakeEngine([([("de", .9)], [bad])]), chunk, 0, [], None, None, context=context)
+        assert lines == [{"t": 0.0, "end": 1.0, "lang": "de", "conf": 0.9, "text": "So als Riech."}]
+
+
+def test_the_values_of_a_failed_decode_never_leave_the_screening(monkeypatch, tmp_path, capsys):
+    import numpy as np
+    spans = [{"start": 16000 * s, "end": 16000 * (s + 6)} for s in (0, 20)]
+    vad = SimpleNamespace(VadOptions=lambda **kw: None, get_speech_timestamps=lambda audio, opts: _spans_for(audio, spans))
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(vad=vad))
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", vad)
+    monkeypatch.setattr(mt, "load_audio", lambda src, track=None: np.repeat(np.arange(70, dtype="float32"), 16000))
+    engine = FakeEngine([([("en", .9)], [{"start": 0.5, "end": 2.0, "text": " one", "logprob": -0.2, "temp": 0.0, "cr": 0.9}]),
+                         ([("en", .9)], [{"start": 0.5, "end": 5.5, "text": " I don't know.", "logprob": -1.4, "temp": 1.0, "cr": 1.1}])])
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    monkeypatch.setattr(mt, "DATA", tmp_path / "data")
+    lines = mt.transcribe_lines(tmp_path / "x.wav", "en", checkpoint=tmp_path)
+    assert [l.get("text") or l["note"] for l in lines] == ["one", "I don't know."]
+    log = (tmp_path / "partial.jsonl").read_text(encoding="utf-8")
+    out = capsys.readouterr().out
+    for where in (log, out, json.dumps(lines)):
+        assert not any(k in where for k in ('"_lp"', '"_temp"', '"_cr"'))
+    assert "rejected" not in log
+
+
+def test_a_recording_is_screened_as_one_and_an_imported_file_as_media(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(mt, "transcribe_lines", lambda *a, **k: seen.append(k.get("context")) or [{"t": 0.0, "lang": "en", "conf": 1.0, "text": "x"}])
+    d = tmp_path / "20261127-100000-call"
+    d.mkdir()
+    mt.transcribe(d / "audio.wav", d)
+    mt.transcribe(tmp_path / "talk.mp4", d)
+    mt.transcribe(tmp_path / "audio.wav", d)                       # an audio.wav from somewhere else is a file like any
+    mt.transcribe_call(d / "audio.wav", d / "system.wav", d)
+    assert seen == ["recording", "media", "media", "recording", "recording"]
+    assert mt.screening_context(Path("audio.wav"), Path(".")) == "recording"
+
+
+def _live_track(tmp_path, tag, src, allowed=("de",)):
+    return mt.LiveTrack(str(src), tmp_path, tag, src, list(allowed), "fine", None, mt.engine_name())
+
+
+class ScriptEngine:
+    """Decodes a chunk into the scripted line of the second it starts at (speech samples carry their second + 1)."""
+    name = "fake"
+
+    def __init__(self, script):
+        self.script = script
+
+    def analyse(self, chunk, detect=True):
+        return SimpleNamespace(chunk=chunk, probs=[("de", 0.99)] if detect else None)
+
+    def decode(self, state, language):
+        import numpy as np
+        first = int(np.asarray(state.chunk)[np.flatnonzero(state.chunk)[0]] * 32768) - 1
+        return [{"start": 0.0, "end": 1.4, "text": " " + self.script[first], "logprob": -0.3, "temp": 0.0, "cr": 0.8}]
+
+
+def test_an_outro_said_again_and_again_is_withdrawn_from_the_live_window_and_left_out_of_the_file(monkeypatch, tmp_path, capsys):
+    """A plug said in meetings too ("Bitte abonnieren.") at speaking speed is shown; the third copy on one track shows it
+    is Whisper's: it is never shown, the window is cleared and sent every other line of both tracks again, the chunks of
+    the earlier copies are written to the checkpoint again with the mark, and the final pass leaves all three out with
+    the note the window agrees with, without showing them again ('Bis zum nächsten Mal.' is a goodbye several people
+    say: never counted, test_a_goodbye_three_people_say_on_one_track_is_neither_withdrawn_nor_left_out)."""
+    _content_vad(monkeypatch)
+    outro = "Bitte abonnieren."
+    engine = ScriptEngine({0: outro, 1: "Hello.", 8: "Добрый день.", 16: outro, 24: outro})
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    mine = _speech(34, gaps=set(range(34)) - {0, 1, 8, 9, 16, 17, 24, 25})
+    theirs = _speech(34, gaps=set(range(34)) - {1, 2})
+    one, two = _live_track(tmp_path, "", tmp_path / "mine.wav"), _live_track(tmp_path, ".2", tmp_path / "theirs.wav")
+    one.feed(mine)
+    two.feed(theirs)
+    worker = mt.LiveWorker([one, two])
+    worker.start()
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and (len(one.chunks) < 4 or one.pending or two.pending):
+        time.sleep(0.05)
+    worker.stop(wait=10)
+    out = capsys.readouterr().out.splitlines()
+    shown = [json.loads(o.split("\t", 1)[1]) for o in out if o.startswith("@@LINE\t")]
+    clear = out.index("@@CLEAR")
+    before = [json.loads(o.split("\t", 1)[1])["text"] for o in out[:clear] if o.startswith("@@LINE\t")]
+    after = [json.loads(o.split("\t", 1)[1])["text"] for o in out[clear:] if o.startswith("@@LINE\t")]
+    assert before.count(outro) == 2 and "Hello." in before and "Добрый день." in before
+    assert after == ["Hello.", "Добрый день."] and out.count("@@CLEAR") == 1
+    assert all(l["live"] for l in shown) and sum(1 for l in shown if l["text"] == outro) == 2, "the third is never shown"
+    records = [json.loads(x) for x in (tmp_path / "partial.jsonl").read_text(encoding="utf-8").splitlines()]
+    repeated = "an outro said again and again"
+    assert [(r["i"], l.get("made_up")) for r in records for l in r["lines"] if l["text"] == outro] == [
+        (1, None), (3, None), (1, repeated), (3, repeated), (4, repeated)], "the earlier chunks written again, marked"
+    last = {r["i"]: r["lines"] for r in records}                   # what Checkpoint.resume keeps: the last record of a chunk
+    assert [l.get("made_up") for i in sorted(last) for l in last[i] if l["text"] == outro] == [repeated] * 3
+    monkeypatch.setattr(mt, "load_audio", lambda src, track=None: mine.reshape(-1).astype("float32") / 32768)
+    lines = mt.transcribe_lines(tmp_path / "mine.wav", "de", granularity="fine", checkpoint=tmp_path, context="recording")
+    assert [l.get("text") or l["note"] for l in lines] == [
+        "Добрый день.", "3 lines that Whisper makes up on noise (subtitle credits, outros said again and again) were left out"]
+    final = capsys.readouterr().out.splitlines()
+    assert not any(o.startswith("@@LINE\t") and outro in o for o in final), "the final pass never shows a withdrawn copy again"
+    assert "@@CLEAR" not in final, "nothing it shows is left out at its end: no need to start the window over"
+
+
+def test_a_live_track_neither_shows_nor_translates_a_videos_outro_and_screens_as_a_recording(monkeypatch, capsys):
+    monkeypatch.setattr(mt, "EVENTS", True)
+    seen, contexts = [], []
+    track = SimpleNamespace(pending=[(0, 16000 * 6)], chunks=[(0, 16000 * 6)], base=0, audio=list(range(16000 * 6)), allowed=["ru"],
+                            forced="ru", speaker=None, granularity="normal", covered=16000 * 6, fed=16000 * 6, _settle=lambda: None,
+                            cp=SimpleNamespace(record=lambda i, lines: seen.append(lines)))
+
+    def decode_chunk(*a, context="media", **k):
+        contexts.append(context)
+        return mt.screen_made_up([_said("Спасибо за просмотр!", 0.0, 1.4), _said("Добрый день.", 3.0)], 6.0, context)
+    monkeypatch.setattr(mt, "decode_chunk", decode_chunk)
+    translated = []
+    shown = mt.LiveTrack.decode(track, None, translate=lambda lines: translated.extend(l["text"] for l in lines))
+    assert contexts == ["recording"]
+    assert [l["text"] for l in shown] == ["Добрый день."] and translated == ["Добрый день."]
+    assert "Спасибо за просмотр" not in capsys.readouterr().out
+    assert [l.get("made_up") for l in seen[0]] == ["a video's outro or channel plug", None]
+
+
+def test_a_final_pass_that_cannot_reuse_the_live_run_starts_the_window_empty(monkeypatch, tmp_path, capsys):
+    """The languages were changed after a live recording: its chunks are decoded again, so the window, which still shows
+    the live lines, is cleared first; with the live run reused it is not."""
+    _content_vad(monkeypatch)
+    engine = SecondEngine()
+    monkeypatch.setattr(mt, "get_engine", lambda: engine)
+    monkeypatch.setattr(mt, "EVENTS", True)
+    audio = _speech(23, gaps={6, 7, 14, 15, 22})
+    monkeypatch.setattr(mt, "load_audio", lambda src, track=None: audio.reshape(-1).astype("float32") / 32768)
+    for languages, cleared in (("ru,en", True), ("ru", False)):
+        folder = tmp_path / languages
+        folder.mkdir()
+        track = mt.LiveTrack("x.wav", folder, "", tmp_path / "x.wav", ["ru"], "normal", None, mt.engine_name())
+        track.feed(audio[:16000 * 10])
+        track.cut()
+        track.decode(engine)
+        track.close()
+        capsys.readouterr()
+        mt.transcribe_lines(tmp_path / "x.wav", languages, granularity="normal", checkpoint=folder)
+        out = capsys.readouterr().out.splitlines()
+        first_line = next(i for i, o in enumerate(out) if o.startswith("@@LINE\t"))
+        assert ("@@CLEAR" in out[:first_line]) is cleared, languages
+        assert out.count("@@CLEAR") == (1 if cleared else 0)
+
+
+def test_both_engines_hand_on_the_temperature_and_compression_ratio_of_a_decode(monkeypatch):
+    seg = mt._segment(SimpleNamespace(start=0, end=1, text="x", avg_logprob=-1.2, temperature=1.0, compression_ratio=1.1))
+    assert seg == {"start": 0.0, "end": 1.0, "text": "x", "logprob": -1.2, "temp": 1.0, "cr": 1.1}
+    assert mt._segment(SimpleNamespace(start=0, end=1, text="x", avg_logprob=-0.2)) == {"start": 0.0, "end": 1.0, "text": "x", "logprob": -0.2}
+    engine = object.__new__(mt.MLXEngine)
+    engine.repo = "r"
+    engine.lib = SimpleNamespace(transcribe=lambda chunk, **kw: {"segments": [{"start": 0, "end": 30.0, "text": " Thank you.",
+                                                                               "avg_logprob": -0.5, "temperature": 0.0,
+                                                                               "compression_ratio": 0.6}]})
+    assert engine.decode(SimpleNamespace(chunk=[0.0]), "en") == [{"start": 0.0, "end": 30.0, "text": " Thank you.", "logprob": -0.5,
+                                                                   "temp": 0.0, "cr": 0.6}]
 
 
 def test_transcribe_with_one_language_forces_it(monkeypatch, tmp_path):
@@ -1317,6 +1826,87 @@ def test_record_only_reports_the_folder_as_output(monkeypatch, tmp_path, capsys)
     assert out[-2].startswith("@@OUT\t" + str(tmp_path)) and out[-1] == "@@DONE\t0"
     assert out[0].startswith("@@FOLDER\t" + str(tmp_path)) and len(out) == 4                       # the folder first, as soon as it exists
     assert out[1] == "@@NOTE\tRecording stopped at the 0.0333333 min limit"                        # no 10-minute notice for a 2 s limit
+
+
+def test_the_help_of_record_only_says_to_transcribe_into_the_recordings_folder(monkeypatch, tmp_path, capsys):
+    """Transcribed into its own folder, the recording is screened as one (a video's phrases go by their text); without
+    --into, transcribe makes a new folder and screens it as an imported file (1.11.4 review)."""
+    monkeypatch.setattr(sys, "argv", ["mt.py", "record", "--help"])
+    with pytest.raises(SystemExit):
+        mt.main()
+    text = " ".join(capsys.readouterr().out.split())
+    assert "transcribe <folder>/audio.wav --into <folder>" in text
+    assert "call <folder>/mic.wav <folder>/system.wav --into <folder>" in text
+    monkeypatch.setattr(mt, "DATA", tmp_path / "data")
+    d = tmp_path / "20261127-100000-plain"
+    d.mkdir()
+    assert mt.screening_context(d / "audio.wav", mt._data_dir(str(d), "audio")) == "recording"
+
+
+def test_events_of_two_threads_never_glue_into_one_line():
+    """The live worker's resend (@@CLEAR, then many @@LINE) against the main thread's @@LEVEL and @@NOTE, on a pipe as
+    the app reads them: each event is one whole line (1.11.4 review: print() wrote a line and its newline apart,
+    '@@CLEAR@@LEVEL\t0.25'; about 1 line in 4 was glued this way in 0.2 s before the fix)."""
+    line = json.dumps({"t": 1.0, "lang": "de", "conf": 0.9, "text": "x" * 300, "live": True})
+    script = f"""
+import sys, threading
+sys.path.insert(0, {str(Path(mt.__file__).parent)!r})
+import mt
+mt.EVENTS = True
+line = {line!r}
+def worker():
+    for k in range(3000):
+        mt.ev("CLEAR") if k % 100 == 0 else mt.ev("LINE", line)
+def main_thread():
+    for k in range(3000):
+        mt.note(f"note {{k}}") if k % 2 else mt.ev("LEVEL", 0.25)
+threads = [threading.Thread(target=worker), threading.Thread(target=main_thread)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+with mt.EV_LOCK:                     # held, as when a signal handler sends an event while ev() runs: it still goes out
+    mt.ev("NOTE", "inside")
+"""
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert done.returncode == 0, done.stderr
+    got = done.stdout.splitlines()
+    good = re.compile(r"^@@(?:CLEAR|LEVEL\t0\.25|NOTE\tnote \d+|NOTE\tinside|LINE\t" + re.escape(line) + ")$")
+    assert len(got) == 6001 and [g for g in got if not good.match(g)] == []
+
+
+def test_events_stay_whole_on_a_stdout_that_writes_in_pieces(monkeypatch):
+    """The one write() per line keeps events whole on CPython's own stdout; EV_LOCK keeps them whole on a stdout that
+    lets another thread in between its characters as well (a wrapper, a free-threaded build). Without the lock this
+    test glues lines (1.11.4 review: the pipe test above passes without it)."""
+    class Piecewise:
+        def __init__(self):
+            self.out = []
+
+        def write(self, s):
+            for c in s:                                            # one character at a time, letting the other thread in
+                self.out.append(c)
+                time.sleep(0)
+            return len(s)
+
+        def flush(self):
+            pass
+
+    stdout = Piecewise()
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    def send(kind, text):
+        for k in range(200):
+            mt.ev(kind, f"{text} {k}")
+
+    threads = [threading.Thread(target=send, args=("LINE", "worker")), threading.Thread(target=send, args=("NOTE", "main"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    got = "".join(stdout.out).splitlines()
+    good = re.compile(r"^@@(?:LINE\tworker|NOTE\tmain) \d+$")
+    assert len(got) == 400 and [g for g in got if not good.match(g)] == []
 
 
 def test_hours_limit_and_recording_name_are_checked_before_anything_starts(monkeypatch, tmp_path):
@@ -2861,8 +3451,8 @@ def test_a_long_text_goes_to_gemma_in_pieces_of_whole_sentences(monkeypatch):
     assert len(pieces) >= 4 and all(len(p) <= mt.GEMMA_PIECE for p in pieces) and " ".join(pieces) == text
     assert out == " ".join(f"[{len(p)}]" for p in pieces)
     long_sentence = "word " * 700                                                 # one sentence of 3,500 characters
-    assert all(len(p) <= mt.GEMMA_PIECE for p in mt._gemma_pieces(long_sentence.strip()))
-    assert " ".join(mt._gemma_pieces(long_sentence.strip())) == long_sentence.strip(), "cut at words, nothing lost"
+    assert all(len(p) <= mt.GEMMA_PIECE for p in mt._pieces(long_sentence.strip(), mt.GEMMA_PIECE))
+    assert " ".join(mt._pieces(long_sentence.strip(), mt.GEMMA_PIECE)) == long_sentence.strip(), "cut at words, nothing lost"
 
 
 def test_a_gemma_translation_cut_short_goes_on_from_its_log(monkeypatch, tmp_path):
@@ -2900,7 +3490,7 @@ def test_live_gemma_translations_are_marked_and_reused_only_by_gemma(monkeypatch
 
 def test_translator_option_and_its_checks(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(mt, "TRANSLATOR", "nllb")
-    monkeypatch.setattr(mt, "gemma_available", lambda: True)
+    monkeypatch.setattr(mt, "mlx_lm_available", lambda: True)
     monkeypatch.setattr(mt, "OUT", None)
     seen = []
     monkeypatch.setattr(mt, "translate", lambda doc, target, offline=False, source=None, checkpoint=None:
@@ -2913,7 +3503,7 @@ def test_translator_option_and_its_checks(monkeypatch, tmp_path, capsys):
 
 def test_without_mlx_lm_the_gemma_choice_falls_back_to_nllb_with_a_note_instead_of_refusing(monkeypatch, capsys):
     monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
-    monkeypatch.setattr(mt, "gemma_available", lambda: False)
+    monkeypatch.setattr(mt, "mlx_lm_available", lambda: False)
     mt._need_key(["English"], offline=True)                                    # a recording is not refused over it
     assert mt.TRANSLATOR == "nllb" and "TranslateGemma is not available here" in capsys.readouterr().err
     monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
@@ -2926,7 +3516,7 @@ def test_the_regional_codes_are_accepted_by_both_models(monkeypatch):
         ["por_Latn", "por_Latn", "zho_Hant", "zho_Hant", "tgl_Latn", "zho_Hans"]
     assert [mt.gemma_code(c) for c in ("zho_Hant", "zho_Hans", "zh-CN")] == ["zh-TW", "zh", "zh"]
     monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
-    monkeypatch.setattr(mt, "gemma_available", lambda: True)
+    monkeypatch.setattr(mt, "mlx_lm_available", lambda: True)
     mt._need_key(["pt-BR", "zh-TW", "fil"], offline=True)                     # no "does not know"
 
 
@@ -2956,7 +3546,7 @@ def test_a_recording_and_a_call_follower_do_not_wait_for_a_model_download(monkey
         raise Stop
     monkeypatch.setattr(mt, "preflight", stop)
     monkeypatch.setattr(mt, "resolve_device", lambda *a, **k: None)
-    monkeypatch.setattr(mt, "gemma_available", lambda: True)
+    monkeypatch.setattr(mt, "mlx_lm_available", lambda: True)
     for argv in (["record", "--no-transcribe", "--live", "--offline", "--to", "English"],
                  ["follow", str(tmp_path / "m.wav"), str(tmp_path / "s.wav"), "--into", str(tmp_path), "--offline", "--to", "English"]):
         monkeypatch.setattr(sys, "argv", ["mt.py", *argv])
@@ -3037,13 +3627,633 @@ def test_gemma_keeps_a_line_in_the_target_but_turns_chinese_into_traditional_chi
     assert len(released) == 2, "the speech model is released once per translation, not once per line"
 
 
+# ---------- Hy-MT3: the third offline translator (--translator hy) ----------
+# The real functions, before _no_model_downloads (below) replaces them in every test: the tests of fetching and checking use these.
+_REAL = SimpleNamespace(hy_present=mt.hy_present, fetch_hy=mt.fetch_hy, fetch_model=mt.fetch_model, model_present=mt.model_present)
+
+
+class FakeHyTokenizer:
+    """Stands in for mlx-lm's TokenizerWrapper with Tencent's chat template: one user message whose content is the prompt
+    itself (a string), its index is the prompt's ids; a text has one token per word."""
+    def __init__(self):
+        self.prompts, self.eos = [], []
+
+    def add_eos_token(self, token):
+        self.eos.append(token)
+
+    def convert_tokens_to_ids(self, token):
+        return 1
+
+    def apply_chat_template(self, msgs, add_generation_prompt=True):
+        assert add_generation_prompt and len(msgs) == 1 and msgs[0]["role"] == "user"
+        assert isinstance(msgs[0]["content"], str), "the plain prompt, not TranslateGemma's structured content"
+        self.prompts.append(msgs[0]["content"])
+        return [len(self.prompts) - 1] * 10
+
+    def encode(self, text, add_special_tokens=True):
+        assert add_special_tokens is False
+        return list(range(len(text.split())))
+
+
+def _hy_parts(prompt):
+    """(target name, text) of a prompt made by hy_prompt."""
+    m = re.fullmatch(r"Translate the following text into (.+?)\. Note that you should only output the translated result "
+                     r"without any additional explanation:\n\n(.*)", prompt, re.S)
+    return m.group(1), m.group(2)
+
+
+def _fake_hy(monkeypatch, reply=lambda name, text: f"<{name}>{text}", finish="stop"):
+    tok = FakeHyTokenizer()
+    calls, processors = [], []
+
+    def stream_generate(model, tokenizer, prompt, max_tokens=256, **kw):
+        prompt_text = tokenizer.prompts[prompt[0]]
+        name, text = _hy_parts(prompt_text)
+        calls.append({"prompt": prompt_text, "name": name, "text": text, "max_tokens": max_tokens, "kw": kw})
+        out = reply(name, text)
+        yield SimpleNamespace(text=out[:3], finish_reason=None)             # the reply comes in parts, as mlx-lm streams it
+        yield SimpleNamespace(text=out[3:], finish_reason=finish)
+
+    def make_logits_processors(**kw):
+        processors.append(kw)
+        return ["the penalty"]
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(stream_generate=stream_generate))
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", SimpleNamespace(make_logits_processors=make_logits_processors))
+    monkeypatch.setattr(mt, "_load_hy", lambda: ("model", tok))
+    monkeypatch.setattr(mt, "release_engine", lambda: None)
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    return tok, calls, processors
+
+
+def test_hy_names_cover_89_whisper_languages_and_traditional_chinese():
+    assert len(mt.HY_NAMES) == 90
+    assert set(mt.HY_NAMES) - {"zh-TW"} <= mt.WHISPER_LANGS and len(set(mt.HY_NAMES) - {"zh-TW"}) == 89
+    outside = "br bs fo ha haw la ln mi oc sn yo".split()
+    assert sorted(mt.WHISPER_LANGS - set(mt.HY_NAMES)) == sorted(outside)
+    assert [mt.hy_code(c) for c in outside] == [None] * 11
+    assert set(mt.HY_VARIANTS.values()) <= set(mt.HY_NAMES) and set(mt.HY_DENSE_OK) - {"bs"} <= set(mt.HY_NAMES)
+    assert mt.HY_NO_SPACES <= set(mt.HY_NAMES)
+
+
+def test_hy_codes_and_the_names_its_prompt_takes():
+    names = ("Russian", "ru", "Kazakh", "Mongolian", "Norwegian", "jw", "Tagalog", "Filipino", "Traditional Chinese",
+             "zho_Hant", "Chinese", "zh-CN", "Brazilian Portuguese", "European Portuguese", "Cantonese", "rus_Cyrl")
+    assert [mt.hy_code(n) for n in names] == "ru ru kk mn no jw tl tl zh-TW zh-TW zh zh pt pt yue ru".split()
+    assert (mt.HY_NAMES["kk"], mt.HY_NAMES["mn"], mt.HY_NAMES["no"], mt.HY_NAMES["jw"], mt.HY_NAMES["zh-TW"]) == (
+        "Cyrillic Kazakh", "Cyrillic Mongolian", "Norwegian", "Javanese", "Traditional Chinese")
+    assert [mt.hy_code(n) for n in ("Zulu", "Yoruba", "Bosnian", "Klingon", "", None)] == [None] * 6
+    assert mt.hy_pair("ru", "English") == ("ru", "en") and mt.hy_pair(None, "English", "de") == ("de", "en")
+    assert mt.hy_pair("bs", "English") is None and mt.hy_pair("ru", "Yoruba") is None
+
+
+def test_hy_sends_the_cards_plain_prompt(monkeypatch):
+    tok, calls, _ = _fake_hy(monkeypatch)
+    assert mt.hy_translate([("ru", "Привет")], "en") == (["<English>Привет"], 0)
+    assert calls[0]["prompt"] == ("Translate the following text into English. Note that you should only output the "
+                                  "translated result without any additional explanation:\n\nПривет")
+    assert mt.hy_prompt("x", "kk").startswith("Translate the following text into Cyrillic Kazakh. ")
+
+
+def test_hy_decodes_greedily_and_budgets_tokens_for_the_target_script(monkeypatch):
+    tok, calls, processors = _fake_hy(monkeypatch)
+    for tgt in ("en", "hi", "my"):
+        mt.hy_translate([("ru", "раз два три четыре")], tgt)
+    assert [c["max_tokens"] for c in calls] == [64 + 3 * 4, 64 + 9 * 4, 64 + 9 * 4]
+    assert all(c["kw"] == {"logits_processors": ["the penalty"]} for c in calls), "no sampler: argmax"
+    assert processors and all(p == {"repetition_penalty": 1.05, "repetition_context_size": 20} for p in processors)
+    calls.clear()
+    mt.hy_translate([("en", ("a " * 699).strip() + ".")], "hi")                   # 700 tokens in one piece: 64 + 9 * 700
+    assert calls[0]["max_tokens"] == 4096
+
+
+def test_a_long_text_goes_to_hy_in_pieces_and_is_joined_as_the_target_writes(monkeypatch):
+    tok, calls, _ = _fake_hy(monkeypatch, reply=lambda name, text: f"[{len(text)}]")
+    text = " ".join(f"Sentence number {k} is here." for k in range(200))           # about 5,600 characters
+    out, cut = mt.hy_translate([("en", text)], "de")
+    pieces = [c["text"] for c in calls]
+    assert len(pieces) >= 4 and all(len(p) <= mt.HY_PIECE for p in pieces) and " ".join(pieces) == text and cut == 0
+    assert out == [" ".join(f"[{len(p)}]" for p in pieces)]
+    calls.clear()
+    assert mt.hy_translate([("en", text)], "ja")[0] == ["".join(f"[{len(p)}]" for p in pieces)], "no spaces in Japanese"
+
+
+def test_a_hy_piece_that_runs_to_the_limit_is_kept_and_counted(monkeypatch, capsys):
+    tok, calls, _ = _fake_hy(monkeypatch, reply=lambda name, text: "loop loop loop", finish="length")
+    doc = {"lines": [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "да да да"}], "translations": {}}
+    assert mt.translate(doc, "English", offline=True) == ["loop loop loop"]
+    assert "1 line(s) ran to the token limit and may be cut short or repeat" in capsys.readouterr().err
+    live = [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "да да да"}]
+    mt.translate_live(live, ["English"], offline=True)
+    assert live[0]["tr"] == {"English": "loop loop loop"}
+    assert "1 line(s) ran to the token limit" in capsys.readouterr().err
+
+
+def test_translating_a_meeting_with_hy_gives_other_languages_to_nllb(monkeypatch, capsys):
+    tok, calls, _ = _fake_hy(monkeypatch)
+    translator = FakeTranslator()
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: (translator, FakeTokenizer()))
+    doc = {"lines": [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "Привет"},
+                     {"t": 1.0, "lang": "en", "conf": 1.0, "text": "Hello"},
+                     {"t": 2.0, "note": "a note"},
+                     {"t": 3.0, "lang": "bs", "conf": 1.0, "text": "bosanske riječi"},
+                     {"t": 4.0, "lang": "km", "conf": 1.0, "text": "ខ្មែរ"}], "translations": {}}
+    out = mt.translate(doc, "English", offline=True)
+    assert out == ["<English>Привет", "Hello", None, "Tbosanske Triječi", "<English>ខ្មែរ"], "Khmer is Hy-MT3's (not Gemma's)"
+    assert [c["text"] for c in calls] == ["Привет", "ខ្មែរ"]
+    assert {sentence[0] for tokens, _ in translator.calls for sentence in tokens} == {"bos_Latn"}, "only Bosnian to NLLB"
+    assert list(doc["translations"]) == [f"en [{mt.HY}]"]
+    err = capsys.readouterr().err
+    assert "into English with Hy-MT3; 1 already in English; 1 in a language Hy-MT3 does not support go to NLLB" in err
+    assert "3 done before (by Hy-MT3, live, or already in English)" in err
+
+
+def test_the_note_when_no_line_is_in_hys_languages(monkeypatch, capsys):
+    tok, calls, _ = _fake_hy(monkeypatch)
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: (FakeTranslator(), FakeTokenizer()))
+    doc = {"lines": [{"t": 0.0, "lang": "yo", "conf": 1.0, "text": "bawo"}], "translations": {}}
+    assert mt.translate(doc, "English", offline=True) == ["Tbawo"] and calls == []
+    err = capsys.readouterr().err
+    assert "None of the 1 line(s) is in one of Hy-MT3's languages: NLLB translates them into English" in err
+    assert "Translated 0 line(s)" not in err
+
+
+def test_hy_with_a_target_it_lacks_and_with_an_nllb_that_cannot_load(monkeypatch, capsys):
+    tok, calls, _ = _fake_hy(monkeypatch)
+    translator = FakeTranslator()
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: (translator, FakeTokenizer()))
+    doc = {"lines": [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "privet"}], "translations": {}}
+    assert mt.translate(doc, "Yoruba", offline=True) == ["Tprivet"] and calls == []
+    assert "Yoruba is not among Hy-MT3's languages: NLLB translates it" in capsys.readouterr().err
+
+    def no_nllb(**kw):
+        raise OSError("offline")
+    monkeypatch.setattr(mt, "get_nllb", no_nllb)
+    doc = {"lines": [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "privet"}, {"t": 1.0, "lang": "yo", "conf": 1.0, "text": "bawo"},
+                     {"t": 2.0, "lang": "en", "conf": 1.0, "text": "hello"}], "translations": {}}
+    out = mt.translate(doc, "English", offline=True)
+    assert out == ["<English>privet", "bawo", "hello"], "Hy-MT3's lines are kept, NLLB's stay in the original"
+    assert doc["translations"] == {} and "_incomplete" not in doc, "not kept as done: a rerun translates the rest"
+    assert "NLLB could not translate the 1 line(s) Hy-MT3 does not cover (OSError: offline)" in capsys.readouterr().err
+    live = [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "privet"}, {"t": 1.0, "lang": "yo", "conf": 1.0, "text": "bawo"}]
+    mt.translate_live(live, ["English"], offline=True)
+    assert live[0]["tr"] == {"English": "<English>privet"} and "tr" not in live[1]
+    assert "the lines Hy-MT3 does not cover are translated at the end" in capsys.readouterr().err
+
+
+def test_a_hy_translation_cut_short_goes_on_from_its_log(monkeypatch, tmp_path):
+    seen = []
+
+    def reply(name, text):
+        if len(seen) == 2:
+            raise KeyboardInterrupt                                          # the run is stopped after two lines
+        seen.append(text)
+        return "EN " + text
+    tok, calls, _ = _fake_hy(monkeypatch, reply=reply)
+    lines = [{"t": float(k), "lang": "ru", "conf": 1.0, "text": f"строка {k}"} for k in range(4)]
+    with pytest.raises(KeyboardInterrupt):
+        mt.translate({"lines": lines, "translations": {}}, "English", offline=True, checkpoint=tmp_path)
+    assert [p.name.startswith(f"en-{mt.HY.replace('/', '_')}-") for p in (tmp_path / "translations").iterdir()] == [True]
+    tok, calls, _ = _fake_hy(monkeypatch, reply=lambda name, text: "EN " + text)
+    out = mt.translate({"lines": lines, "translations": {}}, "English", offline=True, checkpoint=tmp_path)
+    assert out == [f"EN строка {k}" for k in range(4)] and [c["text"] for c in calls] == ["строка 2", "строка 3"]
+
+
+def test_live_hy_translations_are_marked_and_reused_only_by_hy(monkeypatch):
+    tok, calls, _ = _fake_hy(monkeypatch)
+    translator = FakeTranslator()
+    monkeypatch.setattr(mt, "get_nllb", lambda **kw: (translator, FakeTokenizer()))
+    lines = [{"t": 0.0, "lang": "ru", "conf": 1.0, "text": "Привет"}, {"t": 1.0, "lang": "bs", "conf": 1.0, "text": "zdravo"}]
+    mt.translate_live(lines, ["English"], offline=True)
+    assert lines[0]["tr"] == {"English": "<English>Привет"} and lines[0]["tr_by"] == {"English": mt.HY}
+    assert lines[1]["tr"] == {"English": "Tzdravo"} and lines[1]["tr_by"] == {"English": mt.NLLB}
+    assert mt.translated_live(lines, "English", True) == {0: "<English>Привет", 1: "Tzdravo"}
+    monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
+    assert mt.translated_live(lines, "English", True) == {1: "Tzdravo"}, "with TranslateGemma at the end it is made again"
+    monkeypatch.setattr(mt, "TRANSLATOR", "nllb")
+    assert mt.translated_live(lines, "English", True) == {1: "Tzdravo"}
+
+
+def test_the_live_worker_loads_hy_beside_the_speech_model_and_goes_on_without_nllb(monkeypatch, capsys):
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    loaded = []
+    monkeypatch.setattr(mt, "get_hy", lambda keep_engine=False: loaded.append(("hy", keep_engine)))
+    monkeypatch.setattr(mt, "get_nllb", lambda keep_engine=False: loaded.append(("nllb", keep_engine)))
+    mt.LiveWorker([], targets=["English"], offline=True).load_models()
+    mt.LiveWorker([], targets=["Yoruba"], offline=True).load_models()
+    assert loaded == [("hy", True), ("nllb", True)]
+    fetched = []
+
+    def fetch(repo, size, stage=True):
+        fetched.append((repo, size, stage))
+        if repo == mt.NLLB:
+            raise OSError("offline")
+    monkeypatch.setattr(mt, "fetch_model", fetch)
+    worker = mt.LiveWorker([], targets=["English"], offline=True)
+    worker.fetch_models()
+    assert fetched == [(mt.HY, "about 4.2 GB", False), (mt.NLLB, "about 1.4 GB", False)], "never a stage while recording"
+    assert not worker.translation_off and worker.models_here.is_set()
+    assert "NLLB could not be fetched (OSError); the lines Hy-MT3 does not cover are translated at the end" in capsys.readouterr().err
+
+
+def test_a_wrong_hy_file_is_not_downloaded_again_on_the_live_workers_thread(monkeypatch):
+    """hy_present looks at presence only, so no fetch thread runs; a checksum mismatch found when the live worker loads the
+    model must not download 4.2 GB there (no chunk would be decoded meanwhile): live translation is off, with the reason."""
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    monkeypatch.setattr(mt, "HY", mt.HY_DEFAULT)
+    calls = []
+
+    def fetch_hy(stage=True, refetch=True):
+        calls.append((stage, refetch))
+        if not refetch:
+            raise RuntimeError("The Hy-MT3 file model.safetensors from x does not match its checksum; it is downloaded again "
+                               "when the recording is translated at the end")
+        return {}
+    monkeypatch.setattr(mt, "fetch_hy", fetch_hy)
+    monkeypatch.setattr(mt, "get_hy", lambda keep_engine=False: pytest.fail("not loaded after a failed check"))
+    notes = []
+    monkeypatch.setattr(mt, "note", notes.append)
+    worker = mt.LiveWorker([], targets=["English"], offline=True)
+    worker.models_here.set()
+    worker.translate([{"text": "привет", "lang": "ru"}])
+    assert calls == [(False, False)] and worker.translation_off
+    assert notes and "could not be loaded" in notes[0] and "downloaded again when the recording is translated" in notes[0]
+    monkeypatch.setattr(mt, "HY", "someone/Hy-MT3-7B-8bit")                    # another copy: no pinned files to check
+    loaded = []
+    monkeypatch.setattr(mt, "get_hy", lambda keep_engine=False: loaded.append(keep_engine))
+    mt.LiveWorker([], targets=["English"], offline=True).load_models()
+    assert loaded == [True] and calls == [(False, False)]
+
+
+def test_preflight_shows_the_advice_of_a_failed_check(monkeypatch, capsys):
+    def fetch_model(repo, size, stage=True):
+        raise RuntimeError("The Hy-MT3 file f from a/b does not match its checksum (...). Delete the folder ~/x")
+    monkeypatch.setattr(mt, "fetch_model", fetch_model)
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    mt.preflight(0, 1, ["English"])
+    assert "could not be fetched now (RuntimeError: The Hy-MT3 file f from a/b does not match its checksum (...). Delete " \
+           "the folder ~/x)" in capsys.readouterr().err
+    monkeypatch.setattr(mt, "fetch_model", lambda repo, size, stage=True: (_ for _ in ()).throw(OSError("secret path")))
+    mt.preflight(0, 1, ["English"])
+    assert "could not be fetched now (OSError);" in capsys.readouterr().err, "other errors: the type only, as before"
+
+
+def test_translator_option_accepts_hy(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(mt, "TRANSLATOR", "nllb")
+    monkeypatch.setattr(mt, "mlx_lm_available", lambda: True)
+    monkeypatch.setattr(mt, "OUT", None)
+    seen = []
+    monkeypatch.setattr(mt, "translate", lambda doc, target, offline=False, source=None, checkpoint=None:
+                        seen.append((mt.TRANSLATOR, offline)) or [l.get("text") for l in doc["lines"]])
+    (tmp_path / "a.txt").write_text("[00:00:01] [ru] привет\n")
+    monkeypatch.setattr(sys, "argv", ["mt.py", "translate", str(tmp_path / "a.txt"), "--to", "English", "--offline", "--translator", "hy"])
+    mt.main()
+    assert seen == [("hy", True)], "--translator sets the run's translator"
+    monkeypatch.setattr(sys, "argv", ["mt.py", "translate", "--help"])
+    with pytest.raises(SystemExit):
+        mt.main()
+    assert "{nllb,gemma,hy}" in capsys.readouterr().out
+
+
+def test_without_mlx_lm_the_hy_choice_falls_back_to_nllb_with_a_note(monkeypatch, capsys):
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    monkeypatch.setattr(mt, "mlx_lm_available", lambda: False)                # an Intel Mac, Linux, Windows, or no mlx-lm
+    mt._need_key(["English"], offline=True)
+    err = capsys.readouterr().err
+    assert mt.TRANSLATOR == "nllb" and "Hy-MT3 is not available here (it needs Apple silicon and the mlx-lm package" in err
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    mt._need_key(["English"], offline=False)                                   # with Claude: nothing changes
+    mt._need_key([], offline=True)
+    assert mt.TRANSLATOR == "hy"
+
+
+def test_mlx_lm_is_looked_for_only_on_apple_silicon(monkeypatch):
+    import importlib.util
+    import platform
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "mlx_lm" else None)
+    for system, machine, expected in (("darwin", "arm64", True), ("darwin", "x86_64", False), ("linux", "arm64", False),
+                                      ("win32", "AMD64", False)):
+        monkeypatch.setattr(sys, "platform", system)
+        monkeypatch.setattr(platform, "machine", lambda m=machine: m)
+        assert mt.mlx_lm_available() is expected, (system, machine)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    assert mt.mlx_lm_available() is False, "Apple silicon without mlx-lm"
+
+
+def test_which_models_a_translation_needs_with_hy(monkeypatch):
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    assert mt.translation_models(["English"], True) == [(mt.HY, "about 4.2 GB"), (mt.NLLB, "about 1.4 GB")]
+    assert mt.translation_models(["Yoruba"], True) == [(mt.NLLB, "about 1.4 GB")], "Hy-MT3 only for its languages"
+    assert mt.line_translator("ru", "English", True) == mt.HY and mt.line_translator("bs", "English", True) == mt.NLLB
+    assert mt.line_translator("ru", "English", False) == "claude"
+
+
+def test_the_default_hy_files_are_pinned_and_checked(monkeypatch, tmp_path, capsys):
+    assert {repo for repo, *_ in mt.HY_FILES} == {mt.HY_DEFAULT, "tencent/Hy-MT3-7B"}
+    assert all(re.fullmatch(r"[0-9a-f]{40}", commit) and re.fullmatch(r"[0-9a-f]{64}", sha) for _, commit, _, _, sha in mt.HY_FILES)
+    names = [name for _, _, name, _, _ in mt.HY_FILES]
+    assert len(set(names)) == len(names) == 8 and not any(n.startswith("model-0000") for n in names), "no bf16 shard"
+    assert {name for repo, _, name, _, _ in mt.HY_FILES if repo == mt.HY_DEFAULT} == {"config.json", "model.safetensors",
+                                                                                     "LICENSE.txt", "NOTICE"}
+    assert sum(size for _, _, _, size, _ in mt.HY_FILES) == 4238245157
+    import hashlib
+    monkeypatch.setattr(mt, "MODELS_DIR", tmp_path / "models")
+    good = tmp_path / "good"
+    good.write_bytes(b"hello")
+    sha = hashlib.sha256(b"hello").hexdigest()
+    downloads = []
+    fixed = tmp_path / "fixed"
+
+    def hf_hub_download(repo, name, revision=None, force_download=False):
+        downloads.append((repo, name, revision, force_download))
+        fixed.write_bytes(b"hello" if "fixes" in name else b"HELLO")
+        return str(fixed)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=hf_hub_download))
+    assert mt._check_hy_file("a/b", "c" * 40, "f", 5, sha, str(good)) == str(good) and downloads == []
+    bad = tmp_path / "bad"
+    bad.write_bytes(b"HELLO")
+    assert mt._check_hy_file("a/b", "c" * 40, "fixes", 5, sha, str(bad)) == str(fixed), "downloaded again, then right"
+    assert downloads == [("a/b", "fixes", "c" * 40, True)]
+    with pytest.raises(RuntimeError, match=r"The Hy-MT3 file f from tencent/Hy-MT3-7B does not match its checksum \(expected "
+                                           + sha + r", got [0-9a-f]{64}\)\. Delete the folder "
+                                           r"~/\.cache/huggingface/hub/models--tencent--Hy-MT3-7B and translate again"):
+        mt._check_hy_file("tencent/Hy-MT3-7B", "c" * 40, "f", 5, sha, str(bad))
+    assert len(downloads) == 2, "downloaded again only once"
+    with pytest.raises(RuntimeError, match="Delete the folder"):
+        mt._check_hy_file("tencent/Hy-MT3-7B", "c" * 40, "f", 5, sha, str(bad))
+    assert len(downloads) == 2, "a file that was wrong after its new download is not fetched a third time in the same run"
+    with pytest.raises(RuntimeError, match=r"^The Hy-MT3 file g from a/b does not match its checksum; it is downloaded again "
+                                           r"when the recording is translated at the end$"):
+        mt._check_hy_file("a/b", "c" * 40, "g", 5, sha, str(bad), refetch=False)
+    assert len(downloads) == 2, "on the live worker's thread nothing is downloaded"
+    with pytest.raises(RuntimeError, match="got a file of 5 bytes instead of 6"):
+        mt._check_hy_file("a/b", "c" * 40, "f", 6, sha, str(good))
+    # The big file: hashed once, then known by its path, size and modification time.
+    big = tmp_path / "blob"
+    with open(big, "wb") as f:
+        f.truncate(2**26 + 1)                                                 # sparse: 64 MB of zeros, written at once
+    big_sha = hashlib.sha256(b"\0" * (2**26 + 1)).hexdigest()
+    assert mt._check_hy_file("a/b", "c" * 40, "model.safetensors", 2**26 + 1, big_sha, str(big)) == str(big)
+    assert "Checking the downloaded translation model (once)" in capsys.readouterr().err
+    record = json.loads((tmp_path / "models" / mt.HY_CHECKED).read_text())
+    assert list(record) == [os.path.realpath(big)] and record[os.path.realpath(big)][2] == big_sha
+
+    def no_hash():
+        raise AssertionError("hashed again")
+    monkeypatch.setattr(mt, "hashlib", SimpleNamespace(sha256=no_hash))
+    assert mt._check_hy_file("a/b", "c" * 40, "model.safetensors", 2**26 + 1, big_sha, str(big)) == str(big)
+    assert "Checking" not in capsys.readouterr().err
+    os.utime(big, ns=(0, 10**9))                                                # the file changed: hashed again
+    with pytest.raises(AssertionError, match="hashed again"):
+        mt._check_hy_file("a/b", "c" * 40, "model.safetensors", 2**26 + 1, big_sha, str(big))
+
+
+def test_hy_present_needs_every_file(monkeypatch):
+    monkeypatch.setattr(mt, "hy_present", _REAL.hy_present)
+    monkeypatch.setattr(mt, "model_present", _REAL.model_present)
+    missing = []
+    asked = []
+
+    def try_to_load_from_cache(repo, name, revision=None):
+        asked.append((repo, name, revision))
+        return None if name in missing else object() if name == "NOTICE" and "odd" in missing else f"/cache/{name}"
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(try_to_load_from_cache=try_to_load_from_cache))
+    assert mt.hy_present() and mt.model_present(mt.HY_DEFAULT)
+    assert sorted(asked[:8]) == sorted((repo, name, commit) for repo, commit, name, _, _ in mt.HY_FILES), "each at its commit"
+    missing.append("tokenizer_config.json")
+    assert not mt.hy_present() and not mt.model_present(mt.HY_DEFAULT)
+    missing[:] = ["odd"]                                                        # _CACHED_NO_EXIST: known to be missing
+    assert not mt.hy_present()
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)                  # not installed
+    assert mt.hy_present() is False
+
+
+def test_hy_is_fetched_file_by_file_at_its_commits_before_a_long_job(monkeypatch, capsys):
+    monkeypatch.setattr(mt, "fetch_hy", _REAL.fetch_hy)
+    monkeypatch.setattr(mt, "fetch_model", _REAL.fetch_model)
+    here = {name for _, _, name, _, _ in mt.HY_FILES} - {"model.safetensors", "chat_template.jinja"}
+    downloads, checked = [], []
+
+    def hf_hub_download(repo, name, revision=None, force_download=False):
+        downloads.append((repo, name, revision))
+        here.add(name)
+        return f"/cache/{repo}/{revision}/{name}"
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        hf_hub_download=hf_hub_download,
+        try_to_load_from_cache=lambda repo, name, revision=None: f"/cache/{repo}/{revision}/{name}" if name in here else None))
+    monkeypatch.setattr(mt, "_check_hy_file", lambda repo, commit, name, size, sha, path, stage=True, refetch=True:
+                        checked.append((name, stage)) or path)
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    mt.preflight(0, 1, ["English"])                                            # NLLB: present (the fixture's model_present)
+    assert downloads == [(mt.HY_DEFAULT, "model.safetensors", "dca6fb32e6d61d2657ed714b572307216df2cb5c"),
+                         ("tencent/Hy-MT3-7B", "chat_template.jinja", "38d6c3c31d6b4dbdfc208e0621b822ae7bf6aeb2")]
+    assert sorted(checked) == sorted((name, True) for _, _, name, _, _ in mt.HY_FILES), "every file checked, not only the new"
+    assert "Downloading the translation model Hy-MT3 7B (first time only, about 4.2 GB)" in capsys.readouterr().err
+    downloads.clear()
+    checked.clear()
+    paths = mt.fetch_hy(stage=False)
+    assert downloads == [] and len(checked) == 8 and "Downloading" not in capsys.readouterr().err
+    assert paths["model.safetensors"] == f"/cache/{mt.HY_DEFAULT}/dca6fb32e6d61d2657ed714b572307216df2cb5c/model.safetensors"
+    here.discard("NOTICE")
+    monkeypatch.setattr(mt, "EVENTS", True)
+    mt.fetch_hy(stage=False)                                                   # during a recording: a plain line, no stage
+    out, err = capsys.readouterr()
+    assert "@@STAGE" not in out and "Downloading the translation model Hy-MT3" in err
+    monkeypatch.setattr(mt, "HY", "someone/Hy-MT3-7B-8bit")                    # another copy: the usual whole-repo fetch
+    pulled = []
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=lambda repo, **k: pulled.append(repo)))
+    monkeypatch.setattr(mt, "model_present", lambda repo: False)
+    mt.fetch_model(mt.HY, "about 4.2 GB", stage=False)
+    assert pulled == ["someone/Hy-MT3-7B-8bit"]
+
+
+def test_the_pinned_hy_model_is_loaded_from_its_two_snapshots_with_its_end_tokens(monkeypatch):
+    tok = FakeHyTokenizer()
+    seen = {}
+
+    def load_model(path):
+        seen["model"] = path
+        return "model", {"eos_token_id": [127960, 127967]}
+
+    def load_tokenizer(path, eos_token_ids=None):
+        seen["tokenizer"] = (path, eos_token_ids)
+        return tok
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", SimpleNamespace(load_model=load_model, load_tokenizer=load_tokenizer))
+    monkeypatch.setattr(mt, "fetch_hy", lambda stage=True: {"model.safetensors": "/c/w/snap/model.safetensors",
+                                                            "tokenizer.json": "/c/t/snap/tokenizer.json"})
+    monkeypatch.setattr(mt, "HY", mt.HY_DEFAULT)
+    mt._load_hy.cache_clear()
+    try:
+        assert mt._load_hy() == ("model", tok)
+        assert seen == {"model": Path("/c/w/snap"), "tokenizer": (Path("/c/t/snap"), [127960, 127967])}
+        assert tok.eos == ["<|eos|>", "<|extra_5|>"]
+        mt._load_hy.cache_clear()
+        tok.eos.clear()
+        tok.unk_token_id = 1                                                   # <|extra_5|> not in this vocabulary
+        mt._load_hy()
+        assert tok.eos == ["<|eos|>"]
+    finally:
+        mt._load_hy.cache_clear()
+
+
+def test_a_hy_model_from_a_folder_or_another_repo_is_loaded_as_it_is(monkeypatch, tmp_path):
+    tok = FakeHyTokenizer()
+    loaded = []
+    failure = []
+
+    def load(path):
+        loaded.append(path)
+        if failure:
+            raise failure[0]
+        return "model", tok
+
+    def no_download(*a, **k):
+        raise AssertionError("nothing is downloaded for a folder")
+    monkeypatch.setitem(sys.modules, "mlx_lm", SimpleNamespace(load=load))
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(hf_hub_download=no_download, snapshot_download=no_download))
+    monkeypatch.setattr(mt, "fetch_hy", no_download)
+    folder = tmp_path / "hy-mt3-7b-4bit"
+    folder.mkdir()
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    mt._load_hy.cache_clear()
+    try:
+        for given, expected in ((str(folder), str(folder)), ("someone/Hy-MT3-7B-8bit", "someone/Hy-MT3-7B-8bit")):
+            monkeypatch.setattr(mt, "HY", given)
+            mt._load_hy.cache_clear()
+            assert mt._load_hy() == ("model", tok) and loaded[-1] == expected and tok.eos[-2:] == ["<|eos|>", "<|extra_5|>"]
+        monkeypatch.setattr(mt, "HY", str(folder))
+        name = mt.llm_model_name()
+        assert re.fullmatch(r"hy-mt3-7b-4bit-[0-9a-f]{8}", name), "a folder's log is named after the folder, not its whole path"
+        other = tmp_path / "b" / "hy-mt3-7b-4bit"
+        other.mkdir(parents=True)
+        monkeypatch.setattr(mt, "HY", str(other))
+        assert mt.llm_model_name() != name, "two folders of the same name keep their logs apart"
+        doc = {"lines": [{"lang": "ru", "text": "Привет"}]}
+        logs = {mt._llm_log(tmp_path / "data", "en", doc["lines"])}
+        monkeypatch.setattr(mt, "HY", str(folder))
+        logs.add(mt._llm_log(tmp_path / "data", "en", doc["lines"]))
+        assert len(logs) == 2
+        assert mt.translation_models(["English"], True)[0] == (str(folder), "about 4.2 GB")
+        failure.append(ValueError("Tokenizer class TokenizersBackend does not exist or is not currently imported."))
+        mt._load_hy.cache_clear()
+        with pytest.raises(RuntimeError, match=r"needs transformers 5 \('TokenizersBackend'\); put Tencent's "
+                                               r"tokenizer_config\.json \(https://huggingface\.co/tencent/Hy-MT3-7B/blob/main/"
+                                               r"tokenizer_config\.json\) in its place, or unset MT_HY_MODEL"):
+            mt._load_hy()
+        failure[:] = [ValueError("something else")]
+        mt._load_hy.cache_clear()
+        with pytest.raises(ValueError, match="something else"):
+            mt._load_hy()
+    finally:
+        mt._load_hy.cache_clear()
+
+
+def test_a_model_in_a_local_folder_is_present_and_never_fetched(monkeypatch, tmp_path, capsys):
+    """MT_HY_MODEL (or MT_GEMMA_MODEL) naming a folder: huggingface_hub takes no path as a repo id (HFValidationError), so
+    the folder must be taken as present before the cache is asked, or live translation is off and preflight says it
+    downloads 4.2 GB."""
+    monkeypatch.setattr(mt, "model_present", _REAL.model_present)
+    monkeypatch.setattr(mt, "fetch_model", _REAL.fetch_model)
+
+    def snapshot_download(repo, **k):
+        if repo == mt.NLLB:
+            return "/cache/nllb"
+        raise ValueError(f"Repo id must be in the form 'repo_name' or 'namespace/repo_name': '{repo}'")   # as HFValidationError
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=snapshot_download))
+    monkeypatch.setattr(mt, "_nllb_weights_here", lambda path: True)
+    folder = tmp_path / "hy-mt3-7b-4bit"
+    folder.mkdir()
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    monkeypatch.setattr(mt, "HY", str(folder))
+    assert mt.model_present(mt.HY)
+    mt.fetch_model(mt.HY, mt.llm_size(), stage=False)
+    mt.preflight(0, 1, ["English"])
+    assert "Fetching" not in capsys.readouterr().err and "could not be fetched" not in capsys.readouterr().err
+    worker = mt.LiveWorker([], targets=["English"], offline=True)
+    worker.fetch_models()
+    assert not worker.translation_off and worker.models_here.is_set()
+    monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
+    monkeypatch.setattr(mt, "GEMMA", str(folder))
+    assert mt.model_present(mt.GEMMA), "TranslateGemma from a folder too"
+    monkeypatch.setattr(mt, "HY", "~/no-such-folder-for-hy")                  # not a folder: asked as a repo id, as before
+    assert not mt.model_present(mt.HY)
+
+
+def test_an_nllb_download_cut_short_is_not_taken_as_present(monkeypatch, tmp_path, capsys):
+    """An HTTP 429 or a lost network leaves NLLB's snapshot folder with the small files and no model.bin; it must be
+    fetched again, not loaded ("Unable to open file 'model.bin'" at every run)."""
+    monkeypatch.setattr(mt, "model_present", _REAL.model_present)
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "tokenizer.json").write_text("{}")
+    pulled = []
+
+    def snapshot_download(repo, local_files_only=False):
+        if not local_files_only:
+            pulled.append(repo)
+            (snap / "model.bin").write_bytes(b"w")
+        return str(snap)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=snapshot_download))
+    monkeypatch.setitem(sys.modules, "tokenizers", SimpleNamespace(Tokenizer=SimpleNamespace(from_file=lambda p: "tok")))
+    monkeypatch.setattr(mt, "import_ctranslate2", lambda: SimpleNamespace(Translator=lambda path, **k: ("translator", path)))
+    monkeypatch.setattr(mt, "cuda_wanted", lambda ct2: False)
+    assert not mt.model_present(mt.NLLB)
+    mt._load_nllb.cache_clear()
+    try:
+        assert mt._load_nllb() == (("translator", str(snap)), "tok") and pulled == [mt.NLLB]
+        assert f"Downloading the translation model {mt.NLLB}" in capsys.readouterr().err
+        assert mt.model_present(mt.NLLB)
+        mt._load_nllb.cache_clear()
+        mt._load_nllb()
+        assert pulled == [mt.NLLB], "complete: loaded from the cache"
+    finally:
+        mt._load_nllb.cache_clear()
+
+
+def test_the_memory_note_for_hy(monkeypatch, capsys):
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    monkeypatch.setattr(mt, "total_memory", lambda: 8 * 2**30)
+    mt.preflight(0, 1, ["English"], fetch=False)
+    err = capsys.readouterr().err
+    assert "This computer has 8 GB of memory: Hy-MT3 needs about 4.5 GB (about 6 GB beside the speech model" in err
+    assert "TranslateGemma" not in err
+    mt.preflight(0, 1, [], fetch=False)
+    assert "Hy-MT3" not in capsys.readouterr().err, "nothing translated offline: no note"
+    monkeypatch.setattr(mt, "total_memory", lambda: 16 * 2**30)
+    mt.preflight(0, 1, ["English"], fetch=False)
+    assert "Hy-MT3" not in capsys.readouterr().err
+    monkeypatch.setattr(mt, "TRANSLATOR", "gemma")
+    monkeypatch.setattr(mt, "total_memory", lambda: 8 * 2**30)
+    mt.preflight(0, 1, ["English"], fetch=False)
+    assert "TranslateGemma needs about 7 GB" in capsys.readouterr().err, "TranslateGemma's note as before (below 16 GB)"
+
+
+def test_the_windows_path_check_counts_the_hy_log(monkeypatch):
+    monkeypatch.setattr(mt, "windows_long_paths", lambda: False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(mt, "NLLB", "a/b")                                     # a short NLLB: the Hy-MT3 log is the longest
+    folder = Path(os.path.abspath(os.sep + "d" * 200))
+    monkeypatch.setattr(mt, "TRANSLATOR", "hy")
+    problem = mt.windows_path_problem(folder, ["English"], True)
+    assert problem and mt.translation_log_name("zho_Hant", mt.HY, "0" * 16) in problem
+    monkeypatch.setattr(mt, "TRANSLATOR", "nllb")
+    assert mt.windows_path_problem(folder, ["English"], True) is None
+
+
 @pytest.fixture(autouse=True)
 def _no_model_downloads(monkeypatch, request):
-    """No test downloads a translation model: the cache is taken as holding them, and a fetch does nothing. The stream
+    """No test downloads a translation model: the cache is taken as holding them (Hy-MT3's pinned files too), and a fetch
+    does nothing (the tests of fetching and checking Hy-MT3 put the real functions back, from _REAL). The stream
     switch of mlx-lm needs the real MLX (it was run against MLX 0.29.3, 0.31.2, 0.32.0 and 0.32.4); it is left out except
     in its own test, which gives it a stand-in MLX."""
     monkeypatch.setattr(mt, "model_present", lambda repo: True)
     monkeypatch.setattr(mt, "fetch_model", lambda repo, size, stage=True: None)
+    monkeypatch.setattr(mt, "hy_present", lambda: True)
+    monkeypatch.setattr(mt, "fetch_hy", lambda stage=True, refetch=True: {})
+    monkeypatch.setattr(mt, "_HY_REFETCHED", set())
     monkeypatch.setattr(mt, "_NLLB_FAILED", [])
     if "gets_a_stream_of_its_own" not in request.node.name:
         monkeypatch.setattr(mt, "_thread_stream", lambda: None)
